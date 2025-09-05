@@ -5,3 +5,4 @@ fastapi==0.114.2
 uvicorn==0.30.6
 sqlitedict==2.1.0
 python-dotenv==1.0.1
+pandas==2.2.2
