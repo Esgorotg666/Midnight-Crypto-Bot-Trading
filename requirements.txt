@@ -1,6 +1,6 @@
 python-telegram-bot==21.4
 ccxt==4.3.89
-pandas==2.2.2
+pandas==2.2.3
 numpy==1.26.4
 APScheduler==3.10.4
 fastapi==0.114.2
