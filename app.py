@@ -7,8 +7,7 @@ load_dotenv()
 from sqlitedict import SqliteDict
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-import pandas as pd
-import numpy as np
+
 import ccxt
 
 from fastapi import FastAPI
