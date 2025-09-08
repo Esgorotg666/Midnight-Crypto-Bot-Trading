@@ -217,6 +217,9 @@ async def broadcast(text: str, app: Application):
 # -----------------------------
 # SCHEDULER (with robust logging)
 # -----------------------------
+import traceback
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 async def scheduled_job(app: Application):
     try:
         sig = await engine.signal()
