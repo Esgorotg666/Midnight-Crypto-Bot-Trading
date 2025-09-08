@@ -21,8 +21,9 @@ import uvicorn
 
 from telegram import Update, LabeledPrice
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes, MessageHandler, filters
+    Application, CommandHandler, ContextTypes, PreCheckoutQueryHandler, MessageHandler, filters
 )
+
 
 # -----------------------------
 # ENV VARS
@@ -223,7 +224,8 @@ application.add_handler(CommandHandler("status", cmd_status))
 application.add_handler(CommandHandler("cancel", cmd_cancel))
 application.add_handler(CommandHandler("signalson", cmd_signalson))
 application.add_handler(CommandHandler("signalsoff", cmd_signalsoff))
-application.add_handler(MessageHandler(filters.StatusUpdate.PRE_CHECKOUT_QUERY, precheckout))
+application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+application.add_handler(PreCheckoutQueryHandler(precheckout))
 application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
 # Scheduler
