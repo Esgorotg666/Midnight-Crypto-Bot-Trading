@@ -3,6 +3,7 @@ import time
 import asyncio
 import logging
 import sqlite3
+import traceback
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -21,25 +22,25 @@ import uvicorn
 
 from telegram import Update, LabeledPrice
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes, PreCheckoutQueryHandler, MessageHandler, filters
+    Application, CommandHandler, ContextTypes,
+    PreCheckoutQueryHandler, MessageHandler, filters
 )
 
-
 # -----------------------------
-# ENV VARS
+# ENV
 # -----------------------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 PAIR      = os.getenv("PAIR", "BTC/USDT")
 EXCHANGE  = os.getenv("EXCHANGE", "binance")
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
-STARS_PRICE_XTR = int(os.getenv("STARS_PRICE_XTR", "10000"))   # ~ $10 by default
-PUBLIC_URL = os.getenv("PUBLIC_URL")  # e.g., https://your-service.onrender.com
+STARS_PRICE_XTR = int(os.getenv("STARS_PRICE_XTR", "10000"))   # default ≈ $10
+PUBLIC_URL = os.getenv("PUBLIC_URL")  # e.g. https://your-app.onrender.com
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
 
 # -----------------------------
-# SQLITE (no external deps)
+# SQLITE (built-in)
 # -----------------------------
 DB_PATH = "subs.sqlite"
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -81,7 +82,7 @@ def wants(uid: int) -> bool:
     return bool(row[0]) if row else True  # default True
 
 # -----------------------------
-# STRATEGY (pandas + numpy)
+# STRATEGY (pandas + numpy) with guards
 # -----------------------------
 class Engine:
     def __init__(self, exchange_id, pair, timeframe):
@@ -93,7 +94,17 @@ class Engine:
     async def fetch_df(self, limit=300):
         def get_ohlcv():
             return self.ex.fetch_ohlcv(self.pair, timeframe=self.tf, limit=limit)
-        ohlcv = await asyncio.to_thread(get_ohlcv)
+
+        try:
+            ohlcv = await asyncio.to_thread(get_ohlcv)
+        except Exception as e:
+            logging.warning("fetch_ohlcv failed: %s", e)
+            return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
+
+        if not ohlcv or len(ohlcv) < 210:
+            logging.info("Not enough candles: %s", len(ohlcv) if ohlcv else 0)
+            return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
+
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
         df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
         return df
@@ -110,7 +121,7 @@ class Engine:
 
     async def signal(self):
         df = await self.fetch_df()
-        if len(df) < 200:
+        if df.empty or len(df) < 200:
             return None
 
         df["sma50"] = df["close"].rolling(50).mean()
@@ -156,7 +167,7 @@ async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         provider_token="",          # empty for Stars
         currency="XTR",             # Telegram Stars currency
         prices=prices,
-        subscription_period=2592000 # 30 days (in seconds)
+        subscription_period=2592000 # 30 days
     )
 
 async def precheckout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -203,42 +214,57 @@ async def broadcast(text: str, app: Application):
         except Exception as e:
             logging.warning(f"send fail {uid}: {e}")
 
+# -----------------------------
+# SCHEDULER (with robust logging)
+# -----------------------------
 async def scheduled_job(app: Application):
     try:
-        s = await engine.signal()
-        if s:
-            await broadcast(s, app)
+        sig = await engine.signal()
+        if sig:
+            await broadcast(sig, app)
     except Exception as e:
-        logging.error(f"job error: {e}")
+        logging.error("scheduled_job crashed: %s", e)
+        logging.error("Traceback:\n%s", traceback.format_exc())
+
+def schedule_jobs(app: Application, scheduler: AsyncIOScheduler):
+    scheduler.add_job(
+        scheduled_job,
+        "interval",
+        minutes=5,
+        args=[app],
+        next_run_time=datetime.now(timezone.utc)  # run ASAP, then every 5 min
+    )
 
 # -----------------------------
-# BUILD APP + FASTAPI WEBHOOK
+# FASTAPI + TELEGRAM APP
 # -----------------------------
 logging.basicConfig(level=logging.INFO)
 application = Application.builder().token(BOT_TOKEN).build()
 
-# Handlers
+# Telegram handlers
 application.add_handler(CommandHandler("start", cmd_start))
 application.add_handler(CommandHandler("subscribe", cmd_subscribe))
 application.add_handler(CommandHandler("status", cmd_status))
 application.add_handler(CommandHandler("cancel", cmd_cancel))
 application.add_handler(CommandHandler("signalson", cmd_signalson))
 application.add_handler(CommandHandler("signalsoff", cmd_signalsoff))
-application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 application.add_handler(PreCheckoutQueryHandler(precheckout))
 application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
-# Scheduler
-scheduler = AsyncIOScheduler()
-scheduler.add_job(lambda: asyncio.create_task(scheduled_job(application)),
-                  "interval", minutes=5, next_run_time=datetime.now(timezone.utc))
-
-# FastAPI
+# FastAPI app
 api = FastAPI()
 
 @api.get("/")
 def health():
     return {"ok": True}
+
+@api.get("/runjob")
+async def run_job_now():
+    try:
+        await scheduled_job(application)
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 @api.get("/setwebhook")
 async def set_webhook():
@@ -255,13 +281,14 @@ async def telegram_webhook(req: Request):
     await application.process_update(update)
     return {"ok": True}
 
-# Startup / Shutdown
+# Lifecycle
 @api.on_event("startup")
 async def on_startup():
     await application.initialize()
     await application.start()
+    scheduler = AsyncIOScheduler()
+    schedule_jobs(application, scheduler)
     scheduler.start()
-    # If PUBLIC_URL is already set, ensure webhook is attached
     if PUBLIC_URL:
         url = f"{PUBLIC_URL.rstrip('/')}/webhook"
         await application.bot.set_webhook(url)
@@ -269,7 +296,7 @@ async def on_startup():
 
 @api.on_event("shutdown")
 async def on_shutdown():
-    scheduler.shutdown(wait=False)
+    # APScheduler is created in startup; if you need a global ref, promote it.
     await application.stop()
     await application.shutdown()
 
