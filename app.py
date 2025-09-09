@@ -31,13 +31,16 @@ from telegram.ext import (
 # -----------------------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 PAIR      = os.getenv("PAIR", "BTC/USDT")
-EXCHANGE  = os.getenv("EXCHANGE", "binance")
+EXCHANGE  = os.getenv("EXCHANGE", "binanceus")
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 STARS_PRICE_XTR = int(os.getenv("STARS_PRICE_XTR", "10000"))   # default ≈ $10
 PUBLIC_URL = os.getenv("PUBLIC_URL")  # e.g. https://your-app.onrender.com
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
+
+# ✅ Your Telegram ID (only you can use /grantme)
+OWNER_ID = 5467277042
 
 # -----------------------------
 # SQLITE (built-in)
@@ -138,10 +141,10 @@ class Engine:
 
         if long_cond and self.last != "LONG":
             self.last = "LONG"
-            return f"LONG {self.pair} @ {price:.2f} [{self.tf}]  ({ts})\nSMA50>SMA200; RSI crossed up from <45."
+            return f"LONG {self.pair} @ {price:.2f} [{self.tf}]  ({ts})"
         if exit_cond and self.last != "EXIT":
             self.last = "EXIT"
-            return f"EXIT/NEUTRAL {self.pair} @ {price:.2f} [{self.tf}]  ({ts})\nRSI>65 or SMA50<SMA200."
+            return f"EXIT/NEUTRAL {self.pair} @ {price:.2f} [{self.tf}]  ({ts})"
         return None
 
 engine = Engine(EXCHANGE, PAIR, TIMEFRAME)
@@ -165,7 +168,7 @@ async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         description=desc,
         payload=f"sub:{update.effective_user.id}:{now_ts()}",
         provider_token="",          # empty for Stars
-        currency="XTR",             # Telegram Stars currency
+        currency="XTR",             # Telegram Stars
         prices=prices,
         subscription_period=2592000 # 30 days
     )
@@ -203,6 +206,16 @@ async def cmd_signalsoff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     set_opt(update.effective_user.id, False)
     await update.message.reply_text("Alerts paused in this chat.")
 
+# ✅ New: Grant yourself free subscription
+async def cmd_grantme(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return await update.message.reply_text("⛔ Not authorized.")
+    exp = now_ts() + 2592000
+    set_expiry(update.effective_user.id, exp)
+    set_opt(update.effective_user.id, True)
+    dt = datetime.fromtimestamp(exp, tz=timezone.utc)
+    await update.message.reply_text(f"✅ Free subscription granted until {dt:%Y-%m-%d %H:%M UTC}.")
+
 async def broadcast(text: str, app: Application):
     rows = cur.execute(
         "SELECT user_id FROM users WHERE expires_at > ? AND signals_on = 1",
@@ -215,11 +228,8 @@ async def broadcast(text: str, app: Application):
             logging.warning(f"send fail {uid}: {e}")
 
 # -----------------------------
-# SCHEDULER (with robust logging)
+# SCHEDULER
 # -----------------------------
-import traceback
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
 async def scheduled_job(app: Application):
     try:
         sig = await engine.signal()
@@ -235,7 +245,7 @@ def schedule_jobs(app: Application, scheduler: AsyncIOScheduler):
         "interval",
         minutes=5,
         args=[app],
-        next_run_time=datetime.now(timezone.utc)  # run ASAP, then every 5 min
+        next_run_time=datetime.now(timezone.utc)
     )
 
 # -----------------------------
@@ -251,6 +261,7 @@ application.add_handler(CommandHandler("status", cmd_status))
 application.add_handler(CommandHandler("cancel", cmd_cancel))
 application.add_handler(CommandHandler("signalson", cmd_signalson))
 application.add_handler(CommandHandler("signalsoff", cmd_signalsoff))
+application.add_handler(CommandHandler("grantme", cmd_grantme))  # only you
 application.add_handler(PreCheckoutQueryHandler(precheckout))
 application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
@@ -299,7 +310,6 @@ async def on_startup():
 
 @api.on_event("shutdown")
 async def on_shutdown():
-    # APScheduler is created in startup; if you need a global ref, promote it.
     await application.stop()
     await application.shutdown()
 
