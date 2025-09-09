@@ -302,27 +302,20 @@ def plot_signal_chart(
             x_live = x_last + pd.Timedelta(seconds=2)  # nudge right
         except Exception:
             x_live = x_last
-        ax.scatter([x_live], [last_tick], s=55)
-        ax.annotate("LIVE", (x_live, last_tick), xytext=(10, -12), textcoords="offset points")
-        # optional guide from last close to live tick
-        try:
-            last_close = float(dfp["close"].iloc[-1])
-            ax.plot([x_last, x_live], [last_close, last_tick], linewidth=0.8)
-        except Exception:
-            pass
+        ax.scatter([x_live], [last_tick], s=65, zorder=5)
 
-    ax.set_title(f"{pair} — {title_tf or TIMEFRAME}  ({DISPLAY_TZ})")
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Price")
-    ax.legend(loc="best")
-    ax.grid(True, linewidth=0.3)
-
-    buf = io.BytesIO()
-    fig.tight_layout()
-    fig.savefig(buf, format="png")
-    plt.close(fig)
-    buf.seek(0)
-    return buf
+        # Annotate with price directly above the dot
+        ax.annotate(
+            f"{last_tick:.2f}",
+            (x_live, last_tick),
+            xytext=(0, 12),
+            textcoords="offset points",
+            ha="center",
+            fontsize=8,
+            fontweight="bold",
+            color="black",
+            bbox=dict(boxstyle="round,pad=0.2", fc="yellow", alpha=0.7, lw=0)
+        )
 
 # -----------------------------
 # TELEGRAM HELPERS
