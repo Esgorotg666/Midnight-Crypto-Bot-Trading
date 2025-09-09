@@ -34,6 +34,7 @@ from telegram.ext import (
     Application, CommandHandler, ContextTypes,
     PreCheckoutQueryHandler, MessageHandler, filters
 )
+from telegram.error import BadRequest  # for graceful edit fallbacks
 
 # -----------------------------
 # ENV
@@ -249,7 +250,7 @@ class Engine:
         return None, df
 
 # -----------------------------
-# CHARTS (timezone, NOW line, LIVE tick)
+# CHARTS (timezone, NOW line, LIVE tick with price label)
 # -----------------------------
 def plot_signal_chart(
     pair: str,
@@ -257,11 +258,11 @@ def plot_signal_chart(
     mark: str | None,
     price: float | None,
     title_tf: str | None = None,
-    last_tick: float | None = None,   # NEW: consensus “now” price
+    last_tick: float | None = None,   # consensus “now” price
 ):
     """Return a PNG of Close + SMA50/200 with optional BUY/SELL marker,
        displayed in DISPLAY_TZ. If last_tick is provided, overlay it as a
-       'LIVE' dot at the right edge so the chart looks real-time."""
+       'LIVE' dot at the right edge with price label."""
     dfp = df.tail(200).copy()
     if dfp.empty:
         return None
@@ -296,15 +297,13 @@ def plot_signal_chart(
     except Exception:
         x_last = None
 
-    # Overlay synthetic LIVE tick (consensus price) at right edge
+    # Overlay synthetic LIVE tick (consensus price) with price label
     if last_tick and x_last is not None:
         try:
             x_live = x_last + pd.Timedelta(seconds=2)  # nudge right
         except Exception:
             x_live = x_last
         ax.scatter([x_live], [last_tick], s=65, zorder=5)
-
-        # Annotate with price directly above the dot
         ax.annotate(
             f"{last_tick:.2f}",
             (x_live, last_tick),
@@ -313,13 +312,37 @@ def plot_signal_chart(
             ha="center",
             fontsize=8,
             fontweight="bold",
-            color="black",
             bbox=dict(boxstyle="round,pad=0.2", fc="yellow", alpha=0.7, lw=0)
         )
+        # optional guide from last close to live tick
+        try:
+            last_close = float(dfp["close"].iloc[-1])
+            ax.plot([x_last, x_live], [last_close, last_tick], linewidth=0.8)
+        except Exception:
+            pass
+
+    ax.set_title(f"{pair} — {title_tf or TIMEFRAME}  ({DISPLAY_TZ})")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Price")
+    ax.legend(loc="best")
+    ax.grid(True, linewidth=0.3)
+
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
 
 # -----------------------------
 # TELEGRAM HELPERS
 # -----------------------------
+def tz_label_from_ts(ts, fallback: str) -> str:
+    try:
+        return getattr(getattr(ts, "tz", None), "key", None) or ts.tzname() or fallback
+    except Exception:
+        return fallback
+
 async def broadcast(text: str, app: "Application"):
     for (uid,) in active_users():
         try:
@@ -467,14 +490,15 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asof = asof.tz_convert(DISPLAY_TZ)
         except Exception:
             pass
-        asof_str = asof.strftime("%Y-%m-%d %H:%M")
+        asof_str = asof.strftime("%Y-%m-%d %H:%M:%S")
+        tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
 
         png = plot_signal_chart(pair, df, mark, price, title_tf=tf, last_tick=cons)
 
         caption = f"{pair} — {tf}"
         if mark == "LONG": caption += "  •  BUY signal"
         elif mark == "EXIT": caption += "  •  SELL/EXIT signal"
-        caption += f"\nAs of: {asof_str} {DISPLAY_TZ}"
+        caption += f"\nAs of: {asof_str} {tzlab}"
         if cons:
             caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
             if spread is not None:
@@ -486,7 +510,7 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         logging.error("chart error: %s", e)
         await update.message.reply_text("Chart error. Try again shortly.")
 
-# /live – refresh chart every ~10s for ~2min
+# /live – refresh chart every ~10s for ~2min (with edit fallback)
 async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_active(update.effective_user.id):
         return await update.message.reply_text("Inactive. Use /subscribe.")
@@ -533,23 +557,26 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             cons, used, spread, _ = await price_agg.get_consensus(pair)
             png = plot_signal_chart(pair, df, mark, price, title_tf=tf, last_tick=cons)
 
-            # "As of" time in display TZ
+            # "As of" time in display TZ + always-changing Updated: line
             asof = df["time"].iloc[-1]
             try:
                 asof = asof.tz_convert(DISPLAY_TZ)
             except Exception:
                 pass
-            asof_str = asof.strftime("%Y-%m-%d %H:%M")
+            asof_str = asof.strftime("%Y-%m-%d %H:%M:%S")
+            tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
+            updated_str = datetime.utcnow().strftime("%H:%M:%S UTC")
 
             caption = f"{pair} — {tf}"
             if mark == "LONG": caption += "  •  BUY"
             elif mark == "EXIT": caption += "  •  SELL/EXIT"
-            caption += f"\nAs of: {asof_str} {DISPLAY_TZ}"
+            caption += f"\nAs of: {asof_str} {tzlab}"
             if cons:
                 caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
                 if spread is not None:
                     caption += f" (spread {spread:.2f})"
                 caption += f"\nLive tick plotted on chart"
+            caption += f"\nUpdated: {updated_str}"
 
             if photo_msg is None:
                 photo_msg = await update.message.reply_photo(png, caption=caption)
@@ -559,11 +586,25 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     pass
             else:
                 png.seek(0)
-                await ctx.bot.edit_message_media(
-                    chat_id=photo_msg.chat_id,
-                    message_id=photo_msg.message_id,
-                    media=InputMediaPhoto(png, caption=caption)
-                )
+                try:
+                    await ctx.bot.edit_message_media(
+                        chat_id=photo_msg.chat_id,
+                        message_id=photo_msg.message_id,
+                        media=InputMediaPhoto(png, caption=caption)
+                    )
+                except BadRequest as e:
+                    if "Message is not modified" in str(e):
+                        # Force a caption update if media considered same
+                        try:
+                            await ctx.bot.edit_message_caption(
+                                chat_id=photo_msg.chat_id,
+                                message_id=photo_msg.message_id,
+                                caption=caption
+                            )
+                        except Exception as ee:
+                            logging.warning("edit caption fallback failed: %s", ee)
+                    else:
+                        logging.warning("edit media failed: %s", e)
         except Exception as e:
             logging.warning("live update failed: %s", e)
 
@@ -611,9 +652,10 @@ async def scheduled_job(app: "Application"):
                     asof = asof.tz_convert(DISPLAY_TZ)
                 except Exception:
                     pass
-                asof_str = asof.strftime("%Y-%m-%d %H:%M")
+                asof_str = asof.strftime("%Y-%m-%d %H:%M:%S")
+                tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
 
-                caption = text + f"\nAs of: {asof_str} {DISPLAY_TZ}"
+                caption = text + f"\nAs of: {asof_str} {tzlab}"
                 if cons:
                     caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
                     if spread is not None:
