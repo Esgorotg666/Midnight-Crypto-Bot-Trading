@@ -39,8 +39,8 @@ from telegram.ext import (
 # ENV
 # -----------------------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-EXCHANGE  = os.getenv("EXCHANGE", "binanceus")   # default primary exchange
-TIMEFRAME = os.getenv("TIMEFRAME", "1m")         # fast cadence
+EXCHANGE  = os.getenv("EXCHANGE", "binanceus")   # primary exchange
+TIMEFRAME = os.getenv("TIMEFRAME", "1m")         # default TF
 PAIR      = os.getenv("PAIR", "BTC/USDT")        # legacy single pair
 PAIRS_ENV = os.getenv("PAIRS", PAIR)             # multiple pairs support
 PAIRS     = [p.strip() for p in PAIRS_ENV.split(",") if p.strip()]
@@ -48,7 +48,7 @@ PAIRS     = [p.strip() for p in PAIRS_ENV.split(",") if p.strip()]
 EXCHANGES_ENV = os.getenv("EXCHANGES", EXCHANGE) # for consensus price
 EX_LIST = [e.strip() for e in EXCHANGES_ENV.split(",") if e.strip()]
 
-DISPLAY_TZ = os.getenv("DISPLAY_TZ", "UTC")      # <— NEW: chart display timezone
+DISPLAY_TZ = os.getenv("DISPLAY_TZ", "UTC")      # chart display timezone
 
 STARS_PRICE_XTR = int(os.getenv("STARS_PRICE_XTR", "10000"))  # ≈ $10
 PUBLIC_URL = os.getenv("PUBLIC_URL")  # e.g. https://your-app.onrender.com
@@ -249,7 +249,7 @@ class Engine:
         return None, df
 
 # -----------------------------
-# CHARTS (now with timezone & "NOW" line)
+# CHARTS (timezone, NOW line, LIVE tick)
 # -----------------------------
 def plot_signal_chart(
     pair: str,
@@ -257,7 +257,7 @@ def plot_signal_chart(
     mark: str | None,
     price: float | None,
     title_tf: str | None = None,
-    last_tick: float | None = None,   # ⬅️ NEW: consensus “now” price
+    last_tick: float | None = None,   # NEW: consensus “now” price
 ):
     """Return a PNG of Close + SMA50/200 with optional BUY/SELL marker,
        displayed in DISPLAY_TZ. If last_tick is provided, overlay it as a
@@ -289,25 +289,22 @@ def plot_signal_chart(
         ax.scatter([x_sig], [y_sig], s=50)
         ax.annotate(label, (x_sig, y_sig), xytext=(10, 10), textcoords="offset points")
 
-    # “NOW” vertical line at last candle’s timestamp (visual alignment)
+    # “NOW” vertical line at last candle’s timestamp
     try:
         x_last = dfp["time"].iloc[-1]
         ax.axvline(x_last, linewidth=0.7)
     except Exception:
         x_last = None
 
-    # ⬇️ NEW: overlay synthetic live tick (consensus price) at the right edge
+    # Overlay synthetic LIVE tick (consensus price) at right edge
     if last_tick and x_last is not None:
-        # Nudge a hair to the right so it’s visually distinct from the last close
-        # (matplotlib treats datetimes; a few seconds offset is enough)
         try:
-            x_live = x_last + pd.Timedelta(seconds=2)
+            x_live = x_last + pd.Timedelta(seconds=2)  # nudge right
         except Exception:
             x_live = x_last
         ax.scatter([x_live], [last_tick], s=55)
         ax.annotate("LIVE", (x_live, last_tick), xytext=(10, -12), textcoords="offset points")
-
-        # Optional: a faint guide from last close to live tick (no color specified)
+        # optional guide from last close to live tick
         try:
             last_close = float(dfp["close"].iloc[-1])
             ax.plot([x_last, x_live], [last_close, last_tick], linewidth=0.8)
@@ -364,7 +361,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/signalson – Enable alerts here\n"
         "/signalsoff – Pause alerts\n"
         "/chart [PAIR] [TF] – Snapshot chart with markers (e.g. /chart, /chart ETH/USDT 5m)\n"
-        "/live [PAIR] [TF] – Auto-refreshing chart every ~10s for ~2 min\n"
+        "/live [PAIR] [TF] – Auto-refreshing chart every ~10s for ~2 min (with LIVE tick)\n"
         "/pairs – Show requested vs active pairs on the exchange\n"
     )
     if update.effective_user.id == OWNER_ID:
@@ -472,7 +469,6 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         # Consensus + "As of"
         cons, used, spread, _ = await price_agg.get_consensus(pair)
-        # Convert the last timestamp to display TZ for caption
         asof = df["time"].iloc[-1]
         try:
             asof = asof.tz_convert(DISPLAY_TZ)
@@ -480,7 +476,7 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
         asof_str = asof.strftime("%Y-%m-%d %H:%M")
 
-        png = plot_signal_chart(pair, df, mark, price, title_tf=tf)
+        png = plot_signal_chart(pair, df, mark, price, title_tf=tf, last_tick=cons)
 
         caption = f"{pair} — {tf}"
         if mark == "LONG": caption += "  •  BUY signal"
@@ -490,6 +486,7 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
             if spread is not None:
                 caption += f" (spread {spread:.2f})"
+            caption += f"\nLive tick plotted on chart"
 
         await update.message.reply_photo(png, caption=caption)
     except Exception as e:
@@ -541,7 +538,7 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     mark, price = "EXIT", float(row["close"])
 
             cons, used, spread, _ = await price_agg.get_consensus(pair)
-            png = plot_signal_chart(pair, df, mark, price, title_tf=tf)
+            png = plot_signal_chart(pair, df, mark, price, title_tf=tf, last_tick=cons)
 
             # "As of" time in display TZ
             asof = df["time"].iloc[-1]
@@ -559,6 +556,7 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
                 if spread is not None:
                     caption += f" (spread {spread:.2f})"
+                caption += f"\nLive tick plotted on chart"
 
             if photo_msg is None:
                 photo_msg = await update.message.reply_photo(png, caption=caption)
@@ -613,9 +611,8 @@ async def scheduled_job(app: "Application"):
                 if "sma50" not in df.columns: df["sma50"] = df["close"].rolling(50).mean()
                 if "sma200" not in df.columns: df["sma200"] = df["close"].rolling(200).mean()
                 cons, used, spread, _ = await price_agg.get_consensus(pair)
-                png = plot_signal_chart(pair, df, mark, price, title_tf=None)
+                png = plot_signal_chart(pair, df, mark, price, title_tf=None, last_tick=cons)
 
-                # caption: add "As of" in display TZ
                 asof = df["time"].iloc[-1]
                 try:
                     asof = asof.tz_convert(DISPLAY_TZ)
@@ -628,6 +625,7 @@ async def scheduled_job(app: "Application"):
                     caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
                     if spread is not None:
                         caption += f" (spread {spread:.2f})"
+                    caption += f"\nLive tick plotted on chart"
 
                 if png:
                     await broadcast_chart(app, caption=caption, png_buf=png)
