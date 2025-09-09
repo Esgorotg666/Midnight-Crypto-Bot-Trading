@@ -432,16 +432,17 @@ async def telegram_webhook(req: Request):
     await application.process_update(update)
     return {"ok": True}
 
-@api.on_event("startup")
-async def on_startup():
-    # Start Telegram (won't crash app if Telegram is slow)
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     try:
         await application.initialize()
         await application.start()
     except Exception as e:
         logging.error("Telegram init/start failed (API still boots): %s", e)
 
-    # Load markets & filter pairs before scheduling
     await engine.init_markets()
     if not engine.valid_pairs:
         logging.warning("No valid pairs; scheduler will start but do nothing until markets load.")
@@ -453,18 +454,19 @@ async def on_startup():
     if PUBLIC_URL:
         url = f"{PUBLIC_URL.rstrip('/')}/webhook"
         try:
-            await application.bot.set_webhook(url, timeout=30)
+            await application.bot.set_webhook(url)
             logging.info(f"Webhook set to {url}")
         except Exception as e:
             logging.warning("Could not set webhook now: %s", e)
 
-@api.on_event("shutdown")
-async def on_shutdown():
+    yield  # -------- App is running --------
+
+    # Shutdown
     try:
         await application.stop()
         await application.shutdown()
     except Exception:
         pass
 
-if __name__ == "__main__":
-    uvicorn.run(api, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+# Then create the FastAPI app like this (replace the old api = FastAPI()):
+api = FastAPI(lifespan=lifespan)
