@@ -48,6 +48,8 @@ PAIRS     = [p.strip() for p in PAIRS_ENV.split(",") if p.strip()]
 EXCHANGES_ENV = os.getenv("EXCHANGES", EXCHANGE) # for consensus price
 EX_LIST = [e.strip() for e in EXCHANGES_ENV.split(",") if e.strip()]
 
+DISPLAY_TZ = os.getenv("DISPLAY_TZ", "UTC")      # <— NEW: chart display timezone
+
 STARS_PRICE_XTR = int(os.getenv("STARS_PRICE_XTR", "10000"))  # ≈ $10
 PUBLIC_URL = os.getenv("PUBLIC_URL")  # e.g. https://your-app.onrender.com
 
@@ -206,7 +208,7 @@ class Engine:
             return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
 
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-        df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)  # tz-aware UTC
         return df
 
     @staticmethod
@@ -247,21 +249,31 @@ class Engine:
         return None, df
 
 # -----------------------------
-# CHARTS
+# CHARTS (now with timezone & "NOW" line)
 # -----------------------------
 def plot_signal_chart(pair: str, df: pd.DataFrame, mark: str | None, price: float | None, title_tf: str | None = None):
-    """Return a BytesIO PNG of Close + SMA50/200 and optional BUY/SELL marker."""
+    """Return a BytesIO PNG of Close + SMA50/200 and optional BUY/SELL marker, displayed in DISPLAY_TZ."""
     dfp = df.tail(200).copy()
     if dfp.empty:
         return None
 
+    # Convert timestamps to display timezone
+    try:
+        dfp["time"] = dfp["time"].dt.tz_convert(DISPLAY_TZ)
+    except Exception:
+        # If tz conversion fails, keep UTC silently
+        pass
+
     fig, ax = plt.subplots(figsize=(8, 4.5), dpi=140)
+
+    # Price & SMAs
     ax.plot(dfp["time"], dfp["close"], linewidth=1.2, label="Close")
     if "sma50" not in dfp:  dfp["sma50"]  = dfp["close"].rolling(50).mean()
     if "sma200" not in dfp: dfp["sma200"] = dfp["close"].rolling(200).mean()
     ax.plot(dfp["time"], dfp["sma50"], linewidth=1.0, label="SMA50")
     ax.plot(dfp["time"], dfp["sma200"], linewidth=1.0, label="SMA200")
 
+    # Marker for latest signal
     if mark and price:
         x = dfp["time"].iloc[-1]
         y = price
@@ -269,7 +281,13 @@ def plot_signal_chart(pair: str, df: pd.DataFrame, mark: str | None, price: floa
         ax.scatter([x], [y], s=50)
         ax.annotate(label, (x, y), xytext=(10, 10), textcoords="offset points")
 
-    ax.set_title(f"{pair} — {title_tf or TIMEFRAME}  (UTC)")
+    # "NOW" vertical line at the rightmost timestamp in the data
+    try:
+        ax.axvline(dfp["time"].iloc[-1], linewidth=0.7)
+    except Exception:
+        pass
+
+    ax.set_title(f"{pair} — {title_tf or TIMEFRAME}  ({DISPLAY_TZ})")
     ax.set_xlabel("Time")
     ax.set_ylabel("Price")
     ax.legend(loc="best")
@@ -322,7 +340,6 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/live [PAIR] [TF] – Auto-refreshing chart every ~10s for ~2 min\n"
         "/pairs – Show requested vs active pairs on the exchange\n"
     )
-    # owner hint
     if update.effective_user.id == OWNER_ID:
         msg += "\nOwner: /grantme – grant yourself 30 days"
     await update.message.reply_text(msg)
@@ -409,10 +426,12 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if df.empty:
             return await update.message.reply_text(f"No data for {pair} on {tf}. Try later.")
 
+        # Indicators
         df["sma50"] = df["close"].rolling(50).mean()
         df["sma200"] = df["close"].rolling(200).mean()
         df["rsi"] = engine.rsi(df["close"], 14)
 
+        # Latest signal
         mark = None
         price = None
         if len(df) >= 2:
@@ -424,13 +443,22 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             elif exit_cond:
                 mark, price = "EXIT", float(row["close"])
 
-        # consensus
+        # Consensus + "As of"
         cons, used, spread, _ = await price_agg.get_consensus(pair)
+        # Convert the last timestamp to display TZ for caption
+        asof = df["time"].iloc[-1]
+        try:
+            asof = asof.tz_convert(DISPLAY_TZ)
+        except Exception:
+            pass
+        asof_str = asof.strftime("%Y-%m-%d %H:%M")
+
         png = plot_signal_chart(pair, df, mark, price, title_tf=tf)
 
         caption = f"{pair} — {tf}"
         if mark == "LONG": caption += "  •  BUY signal"
         elif mark == "EXIT": caption += "  •  SELL/EXIT signal"
+        caption += f"\nAs of: {asof_str} {DISPLAY_TZ}"
         if cons:
             caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
             if spread is not None:
@@ -460,10 +488,9 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pair = pair or (engine.valid_pairs[0] if engine.valid_pairs else PAIRS[0])
     tf = tf or TIMEFRAME
 
-    # placeholder (in case first fetch fails)
     status_msg = await update.message.reply_text(f"Starting live chart for {pair} ({tf})…")
-
     photo_msg = None
+
     for i in range(12):  # ~2 minutes @ 10s per refresh
         try:
             df = await engine.fetch_df(pair, timeframe=tf)
@@ -489,16 +516,24 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             cons, used, spread, _ = await price_agg.get_consensus(pair)
             png = plot_signal_chart(pair, df, mark, price, title_tf=tf)
 
+            # "As of" time in display TZ
+            asof = df["time"].iloc[-1]
+            try:
+                asof = asof.tz_convert(DISPLAY_TZ)
+            except Exception:
+                pass
+            asof_str = asof.strftime("%Y-%m-%d %H:%M")
+
             caption = f"{pair} — {tf}"
             if mark == "LONG": caption += "  •  BUY"
             elif mark == "EXIT": caption += "  •  SELL/EXIT"
+            caption += f"\nAs of: {asof_str} {DISPLAY_TZ}"
             if cons:
                 caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
                 if spread is not None:
                     caption += f" (spread {spread:.2f})"
 
             if photo_msg is None:
-                # Send first image
                 photo_msg = await update.message.reply_photo(png, caption=caption)
                 try:
                     await status_msg.delete()
@@ -546,17 +581,27 @@ async def scheduled_job(app: "Application"):
             mark, text, price, ts = res
             # 1) text signal
             await broadcast(text, app)
-            # 2) chart image with consensus
+            # 2) chart image with consensus & "As of"
             try:
                 if "sma50" not in df.columns: df["sma50"] = df["close"].rolling(50).mean()
                 if "sma200" not in df.columns: df["sma200"] = df["close"].rolling(200).mean()
                 cons, used, spread, _ = await price_agg.get_consensus(pair)
                 png = plot_signal_chart(pair, df, mark, price, title_tf=None)
-                caption = text
+
+                # caption: add "As of" in display TZ
+                asof = df["time"].iloc[-1]
+                try:
+                    asof = asof.tz_convert(DISPLAY_TZ)
+                except Exception:
+                    pass
+                asof_str = asof.strftime("%Y-%m-%d %H:%M")
+
+                caption = text + f"\nAs of: {asof_str} {DISPLAY_TZ}"
                 if cons:
                     caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
                     if spread is not None:
                         caption += f" (spread {spread:.2f})"
+
                 if png:
                     await broadcast_chart(app, caption=caption, png_buf=png)
             except Exception as ce:
