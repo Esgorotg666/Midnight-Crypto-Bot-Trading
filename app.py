@@ -422,7 +422,7 @@ async def set_webhook():
     if not PUBLIC_URL:
         return JSONResponse({"ok": False, "error": "Set PUBLIC_URL env first"}, status_code=400)
     url = f"{PUBLIC_URL.rstrip('/')}/webhook"
-    await application.bot.set_webhook(url)
+    await application.bot.set_webhook(url)   # ← remove timeout arg
     return {"ok": True, "webhook": url}
 
 @api.post("/webhook")
