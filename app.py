@@ -1,11 +1,14 @@
 import os
 import io
 import time
+import math
 import asyncio
 import logging
 import sqlite3
 import traceback
+from statistics import median
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 
 # Use a headless backend for matplotlib on servers
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -25,7 +28,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import uvicorn
 
-from telegram import Update, LabeledPrice
+from telegram import Update, LabeledPrice, InputMediaPhoto
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application, CommandHandler, ContextTypes,
@@ -36,17 +39,20 @@ from telegram.ext import (
 # ENV
 # -----------------------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-EXCHANGE  = os.getenv("EXCHANGE", "binanceus")
-TIMEFRAME = os.getenv("TIMEFRAME", "1m")            # fast cadence
-PAIR      = os.getenv("PAIR", "BTC/USDT")           # legacy single pair
-PAIRS_ENV = os.getenv("PAIRS", PAIR)                # multiple pairs support
+EXCHANGE  = os.getenv("EXCHANGE", "binanceus")   # default primary exchange
+TIMEFRAME = os.getenv("TIMEFRAME", "1m")         # fast cadence
+PAIR      = os.getenv("PAIR", "BTC/USDT")        # legacy single pair
+PAIRS_ENV = os.getenv("PAIRS", PAIR)             # multiple pairs support
 PAIRS     = [p.strip() for p in PAIRS_ENV.split(",") if p.strip()]
+
+EXCHANGES_ENV = os.getenv("EXCHANGES", EXCHANGE) # for consensus price
+EX_LIST = [e.strip() for e in EXCHANGES_ENV.split(",") if e.strip()]
 
 STARS_PRICE_XTR = int(os.getenv("STARS_PRICE_XTR", "10000"))  # ≈ $10
 PUBLIC_URL = os.getenv("PUBLIC_URL")  # e.g. https://your-app.onrender.com
 
 # Owner for /grantme (your numeric Telegram ID)
-OWNER_ID = 5467277042
+OWNER_ID = int(os.getenv("OWNER_ID", "5467277042"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
@@ -93,6 +99,68 @@ def wants(uid: int) -> bool:
     row = cur.execute("SELECT signals_on FROM users WHERE user_id=?", (uid,)).fetchone()
     return bool(row[0]) if row else True  # default True
 
+def active_users():
+    return cur.execute(
+        "SELECT user_id FROM users WHERE expires_at > ? AND signals_on = 1",
+        (now_ts(),)
+    ).fetchall()
+
+# -----------------------------
+# Multi-exchange consensus price
+# -----------------------------
+def _mad(values):
+    m = median(values)
+    return median([abs(v - m) for v in values]) or 1e-9
+
+class MultiPrice:
+    def __init__(self, exchange_ids: list[str]):
+        self.exes = []
+        for ex in exchange_ids:
+            try:
+                self.exes.append(getattr(ccxt, ex)({"enableRateLimit": True}))
+            except Exception:
+                pass
+
+    async def get_consensus(self, pair: str):
+        async def one(ex):
+            def _t():
+                # Prefer fetch_ticker; fallback to last close via OHLCV(1)
+                try:
+                    t = ex.fetch_ticker(pair)
+                    for key in ("last", "close", "bid", "ask"):
+                        if key in t and t[key]:
+                            return float(t[key])
+                except Exception:
+                    pass
+                try:
+                    o = ex.fetch_ohlcv(pair, timeframe="1m", limit=1)
+                    return float(o[-1][4]) if o else None
+                except Exception:
+                    return None
+            return await asyncio.to_thread(_t)
+
+        tasks = [one(ex) for ex in self.exes]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        raw, per_ex = [], {}
+        for ex, val in zip(self.exes, results):
+            if isinstance(val, Exception) or val is None or not math.isfinite(val):
+                continue
+            raw.append(val)
+            per_ex[ex.id] = val
+
+        if not raw:
+            return None, 0, None, per_ex
+
+        m = median(raw)
+        mad = _mad(raw)
+        kept = [v for v in raw if abs(v - m) <= 3 * mad] or raw
+        cons = median(kept)
+        spread = max(kept) - min(kept) if len(kept) > 1 else 0.0
+        return cons, len(kept), spread, per_ex
+
+price_agg = MultiPrice(EX_LIST)
+
 # -----------------------------
 # STRATEGY ENGINE (multi-pair + valid-pair filtering)
 # -----------------------------
@@ -105,7 +173,6 @@ class Engine:
         self.last = {}  # remember last signal per pair ("LONG"/"EXIT")
 
     async def init_markets(self):
-        """Load exchange markets and filter requested pairs to those actually supported."""
         def _load():
             self.ex.load_markets()
             return set(self.ex.symbols or [])
@@ -113,7 +180,6 @@ class Engine:
             symbols = await asyncio.to_thread(_load)
         except Exception as e:
             logging.warning("Could not load markets for %s: %s", self.ex.id, e)
-            # fallback: try all (fetch_df will guard per pair)
             self.valid_pairs = list(self.requested_pairs)
             return
 
@@ -125,9 +191,10 @@ class Engine:
         if not self.valid_pairs:
             logging.warning("No valid pairs found on %s from requested: %s", self.ex.id, ", ".join(self.requested_pairs))
 
-    async def fetch_df(self, pair, limit=300):
+    async def fetch_df(self, pair, limit=300, timeframe: str | None = None):
+        tf = timeframe or self.tf
         def get_ohlcv():
-            return self.ex.fetch_ohlcv(pair, timeframe=self.tf, limit=limit)
+            return self.ex.fetch_ohlcv(pair, timeframe=tf, limit=limit)
         try:
             ohlcv = await asyncio.to_thread(get_ohlcv)
         except Exception as e:
@@ -182,22 +249,19 @@ class Engine:
 # -----------------------------
 # CHARTS
 # -----------------------------
-def plot_signal_chart(pair: str, df: pd.DataFrame, mark: str | None, price: float | None):
+def plot_signal_chart(pair: str, df: pd.DataFrame, mark: str | None, price: float | None, title_tf: str | None = None):
     """Return a BytesIO PNG of Close + SMA50/200 and optional BUY/SELL marker."""
     dfp = df.tail(200).copy()
     if dfp.empty:
         return None
 
     fig, ax = plt.subplots(figsize=(8, 4.5), dpi=140)
-    # Price
     ax.plot(dfp["time"], dfp["close"], linewidth=1.2, label="Close")
-    # SMAs (ensure present)
     if "sma50" not in dfp:  dfp["sma50"]  = dfp["close"].rolling(50).mean()
     if "sma200" not in dfp: dfp["sma200"] = dfp["close"].rolling(200).mean()
     ax.plot(dfp["time"], dfp["sma50"], linewidth=1.0, label="SMA50")
     ax.plot(dfp["time"], dfp["sma200"], linewidth=1.0, label="SMA200")
 
-    # Marker
     if mark and price:
         x = dfp["time"].iloc[-1]
         y = price
@@ -205,7 +269,7 @@ def plot_signal_chart(pair: str, df: pd.DataFrame, mark: str | None, price: floa
         ax.scatter([x], [y], s=50)
         ax.annotate(label, (x, y), xytext=(10, 10), textcoords="offset points")
 
-    ax.set_title(f"{pair} — {TIMEFRAME}  (UTC)")
+    ax.set_title(f"{pair} — {title_tf or TIMEFRAME}  (UTC)")
     ax.set_xlabel("Time")
     ax.set_ylabel("Price")
     ax.legend(loc="best")
@@ -221,12 +285,6 @@ def plot_signal_chart(pair: str, df: pd.DataFrame, mark: str | None, price: floa
 # -----------------------------
 # TELEGRAM HELPERS
 # -----------------------------
-def active_users():
-    return cur.execute(
-        "SELECT user_id FROM users WHERE expires_at > ? AND signals_on = 1",
-        (now_ts(),)
-    ).fetchall()
-
 async def broadcast(text: str, app: "Application"):
     for (uid,) in active_users():
         try:
@@ -250,6 +308,24 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("You’re active. /signalson to receive alerts. /status shows expiry.")
     else:
         await update.message.reply_text("Access requires a sub. Tap /subscribe to pay with Telegram Stars (30 days).")
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "🛠 Commands\n"
+        "/start – Welcome + subscription info\n"
+        "/subscribe – Buy 30-day access with Telegram Stars\n"
+        "/status – Check your expiry\n"
+        "/cancel – Stop auto-renew (access stays until expiry)\n"
+        "/signalson – Enable alerts here\n"
+        "/signalsoff – Pause alerts\n"
+        "/chart [PAIR] [TF] – Snapshot chart with markers (e.g. /chart, /chart ETH/USDT 5m)\n"
+        "/live [PAIR] [TF] – Auto-refreshing chart every ~10s for ~2 min\n"
+        "/pairs – Show requested vs active pairs on the exchange\n"
+    )
+    # owner hint
+    if update.effective_user.id == OWNER_ID:
+        msg += "\nOwner: /grantme – grant yourself 30 days"
+    await update.message.reply_text(msg)
 
 async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     title = "Midnight Crypto Bot Trading – 30 days"
@@ -309,19 +385,17 @@ async def cmd_grantme(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     dt = datetime.fromtimestamp(exp, tz=timezone.utc)
     await update.message.reply_text(f"✅ Free subscription granted until {dt:%Y-%m-%d %H:%M UTC}.")
 
- # On-demand chart: "/chart", "/chart ETH/USDT", or "/chart ETH/USDT 5m"
+# /chart – snapshot with markers; optional [PAIR] [TF]
 async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_active(update.effective_user.id):
         return await update.message.reply_text("Inactive. Use /subscribe.")
 
-    # Parse args: [pair] [timeframe]
-    pair = None
-    tf = None
     args = [a.strip() for a in ctx.args] if ctx.args else []
+    tf = None
+    pair = None
     if args:
-        # if last arg looks like a timeframe token (e.g. 1m, 5m, 15m, 1h, 4h, 1d)
         maybe_tf = args[-1].lower()
-        if maybe_tf.endswith(("m", "h", "d")) and any(ch.isdigit() for ch in maybe_tf):
+        if maybe_tf.endswith(("m","h","d")) and any(ch.isdigit() for ch in maybe_tf):
             tf = maybe_tf
             args = args[:-1]
     if args:
@@ -335,12 +409,10 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if df.empty:
             return await update.message.reply_text(f"No data for {pair} on {tf}. Try later.")
 
-        # Compute indicators
         df["sma50"] = df["close"].rolling(50).mean()
         df["sma200"] = df["close"].rolling(200).mean()
         df["rsi"] = engine.rsi(df["close"], 14)
 
-        # Check last candle for a signal
         mark = None
         price = None
         if len(df) >= 2:
@@ -352,20 +424,102 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             elif exit_cond:
                 mark, price = "EXIT", float(row["close"])
 
+        # consensus
+        cons, used, spread, _ = await price_agg.get_consensus(pair)
         png = plot_signal_chart(pair, df, mark, price, title_tf=tf)
-        if not png:
-            return await update.message.reply_text("Could not render chart right now.")
 
         caption = f"{pair} — {tf}"
-        if mark == "LONG":
-            caption += "  •  BUY signal"
-        elif mark == "EXIT":
-            caption += "  •  SELL/EXIT signal"
+        if mark == "LONG": caption += "  •  BUY signal"
+        elif mark == "EXIT": caption += "  •  SELL/EXIT signal"
+        if cons:
+            caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
+            if spread is not None:
+                caption += f" (spread {spread:.2f})"
 
         await update.message.reply_photo(png, caption=caption)
     except Exception as e:
         logging.error("chart error: %s", e)
         await update.message.reply_text("Chart error. Try again shortly.")
+
+# /live – refresh chart every ~10s for ~2min
+async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_active(update.effective_user.id):
+        return await update.message.reply_text("Inactive. Use /subscribe.")
+
+    args = [a.strip() for a in ctx.args] if ctx.args else []
+    tf = None
+    pair = None
+    if args:
+        maybe_tf = args[-1].lower()
+        if (maybe_tf.endswith(("m","h","d")) and any(ch.isdigit() for ch in maybe_tf)):
+            tf = maybe_tf
+            args = args[:-1]
+    if args:
+        pair = " ".join(args).upper()
+
+    pair = pair or (engine.valid_pairs[0] if engine.valid_pairs else PAIRS[0])
+    tf = tf or TIMEFRAME
+
+    # placeholder (in case first fetch fails)
+    status_msg = await update.message.reply_text(f"Starting live chart for {pair} ({tf})…")
+
+    photo_msg = None
+    for i in range(12):  # ~2 minutes @ 10s per refresh
+        try:
+            df = await engine.fetch_df(pair, timeframe=tf)
+            if df.empty:
+                await status_msg.edit_text(f"No data for {pair} on {tf}.")
+                break
+
+            df["sma50"] = df["close"].rolling(50).mean()
+            df["sma200"] = df["close"].rolling(200).mean()
+            df["rsi"] = engine.rsi(df["close"], 14)
+
+            mark = None
+            price = None
+            if len(df) >= 2:
+                row, prev = df.iloc[-1], df.iloc[-2]
+                long_cond = (row.sma50 > row.sma200) and (prev.rsi < 45 <= row.rsi)
+                exit_cond = (row.rsi > 65) or (row.sma50 < row.sma200)
+                if long_cond:
+                    mark, price = "LONG", float(row["close"])
+                elif exit_cond:
+                    mark, price = "EXIT", float(row["close"])
+
+            cons, used, spread, _ = await price_agg.get_consensus(pair)
+            png = plot_signal_chart(pair, df, mark, price, title_tf=tf)
+
+            caption = f"{pair} — {tf}"
+            if mark == "LONG": caption += "  •  BUY"
+            elif mark == "EXIT": caption += "  •  SELL/EXIT"
+            if cons:
+                caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
+                if spread is not None:
+                    caption += f" (spread {spread:.2f})"
+
+            if photo_msg is None:
+                # Send first image
+                photo_msg = await update.message.reply_photo(png, caption=caption)
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            else:
+                png.seek(0)
+                await ctx.bot.edit_message_media(
+                    chat_id=photo_msg.chat_id,
+                    message_id=photo_msg.message_id,
+                    media=InputMediaPhoto(png, caption=caption)
+                )
+        except Exception as e:
+            logging.warning("live update failed: %s", e)
+
+        await asyncio.sleep(10)
+
+    try:
+        await update.message.reply_text(f"Live session ended for {pair} ({tf}).")
+    except Exception:
+        pass
 
 # Telegram: show requested vs active pairs
 async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -392,13 +546,19 @@ async def scheduled_job(app: "Application"):
             mark, text, price, ts = res
             # 1) text signal
             await broadcast(text, app)
-            # 2) chart image
+            # 2) chart image with consensus
             try:
                 if "sma50" not in df.columns: df["sma50"] = df["close"].rolling(50).mean()
                 if "sma200" not in df.columns: df["sma200"] = df["close"].rolling(200).mean()
-                png = plot_signal_chart(pair, df, mark, price)
+                cons, used, spread, _ = await price_agg.get_consensus(pair)
+                png = plot_signal_chart(pair, df, mark, price, title_tf=None)
+                caption = text
+                if cons:
+                    caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
+                    if spread is not None:
+                        caption += f" (spread {spread:.2f})"
                 if png:
-                    await broadcast_chart(app, caption=text, png_buf=png)
+                    await broadcast_chart(app, caption=caption, png_buf=png)
             except Exception as ce:
                 logging.warning("chart send failed: %s", ce)
         await asyncio.sleep(0.1)
@@ -416,62 +576,13 @@ def schedule_jobs(app: "Application", scheduler: AsyncIOScheduler):
     )
 
 # -----------------------------
-# FASTAPI + TELEGRAM APP
+# FASTAPI + TELEGRAM APP (lifespan, no deprecation)
 # -----------------------------
 logging.basicConfig(level=logging.INFO)
 
 # Longer network timeouts to avoid startup failures
 request = HTTPXRequest(connect_timeout=20, read_timeout=30, write_timeout=20, pool_timeout=20)
 application = Application.builder().token(BOT_TOKEN).request(request).build()
-
-# Telegram handlers
-application.add_handler(CommandHandler("start", cmd_start))
-application.add_handler(CommandHandler("subscribe", cmd_subscribe))
-application.add_handler(CommandHandler("status", cmd_status))
-application.add_handler(CommandHandler("cancel", cmd_cancel))
-application.add_handler(CommandHandler("signalson", cmd_signalson))
-application.add_handler(CommandHandler("signalsoff", cmd_signalsoff))
-application.add_handler(CommandHandler("grantme", cmd_grantme))
-application.add_handler(CommandHandler("chart", cmd_chart))
-application.add_handler(CommandHandler("pairs", cmd_pairs))
-application.add_handler(PreCheckoutQueryHandler(precheckout))
-application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-
-# FastAPI app
-api = FastAPI()
-
-@api.get("/")
-def health():
-    return {"ok": True}
-
-@api.get("/pairs")
-def list_pairs():
-    return {"requested": PAIRS, "active_on_exchange": engine.valid_pairs}
-
-@api.get("/runjob")
-async def run_job_now():
-    try:
-        await scheduled_job(application)
-        return {"ok": True}
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
-@api.get("/setwebhook")
-async def set_webhook():
-    if not PUBLIC_URL:
-        return JSONResponse({"ok": False, "error": "Set PUBLIC_URL env first"}, status_code=400)
-    url = f"{PUBLIC_URL.rstrip('/')}/webhook"
-    await application.bot.set_webhook(url)   # ← remove timeout arg
-    return {"ok": True, "webhook": url}
-
-@api.post("/webhook")
-async def telegram_webhook(req: Request):
-    data = await req.json()
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
-    return {"ok": True}
-
-from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -493,7 +604,7 @@ async def lifespan(app: FastAPI):
     if PUBLIC_URL:
         url = f"{PUBLIC_URL.rstrip('/')}/webhook"
         try:
-            await application.bot.set_webhook(url)
+            await application.bot.set_webhook(url)  # PTB v21: no timeout arg
             logging.info(f"Webhook set to {url}")
         except Exception as e:
             logging.warning("Could not set webhook now: %s", e)
@@ -507,5 +618,54 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
-# Then create the FastAPI app like this (replace the old api = FastAPI()):
 api = FastAPI(lifespan=lifespan)
+
+# Routes
+@api.get("/")
+def health():
+    return {"ok": True}
+
+@api.get("/pairs")
+def list_pairs():
+    return {"requested": PAIRS, "active_on_exchange": engine.valid_pairs}
+
+@api.get("/runjob")
+async def run_job_now():
+    try:
+        await scheduled_job(application)
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+@api.get("/setwebhook")
+async def set_webhook():
+    if not PUBLIC_URL:
+        return JSONResponse({"ok": False, "error": "Set PUBLIC_URL env first"}, status_code=400)
+    url = f"{PUBLIC_URL.rstrip('/')}/webhook"
+    await application.bot.set_webhook(url)  # PTB v21: no timeout arg
+    return {"ok": True, "webhook": url}
+
+@api.post("/webhook")
+async def telegram_webhook(req: Request):
+    data = await req.json()
+    update = Update.de_json(data, application.bot)
+    await application.process_update(update)
+    return {"ok": True}
+
+# Register Telegram handlers
+application.add_handler(CommandHandler("start", cmd_start))
+application.add_handler(CommandHandler("help", cmd_help))
+application.add_handler(CommandHandler("subscribe", cmd_subscribe))
+application.add_handler(CommandHandler("status", cmd_status))
+application.add_handler(CommandHandler("cancel", cmd_cancel))
+application.add_handler(CommandHandler("signalson", cmd_signalson))
+application.add_handler(CommandHandler("signalsoff", cmd_signalsoff))
+application.add_handler(CommandHandler("grantme", cmd_grantme))
+application.add_handler(CommandHandler("chart", cmd_chart))
+application.add_handler(CommandHandler("live", cmd_live))
+application.add_handler(CommandHandler("pairs", cmd_pairs))
+application.add_handler(PreCheckoutQueryHandler(precheckout))
+application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+
+if __name__ == "__main__":
+    uvicorn.run(api, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
