@@ -309,21 +309,60 @@ async def cmd_grantme(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     dt = datetime.fromtimestamp(exp, tz=timezone.utc)
     await update.message.reply_text(f"✅ Free subscription granted until {dt:%Y-%m-%d %H:%M UTC}.")
 
-# On-demand chart: "/chart" or "/chart ETH/USDT"
+ # On-demand chart: "/chart", "/chart ETH/USDT", or "/chart ETH/USDT 5m"
 async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_active(update.effective_user.id):
         return await update.message.reply_text("Inactive. Use /subscribe.")
-    pair = " ".join(ctx.args).strip().upper() if ctx.args else (engine.valid_pairs[0] if engine.valid_pairs else PAIRS[0])
+
+    # Parse args: [pair] [timeframe]
+    pair = None
+    tf = None
+    args = [a.strip() for a in ctx.args] if ctx.args else []
+    if args:
+        # if last arg looks like a timeframe token (e.g. 1m, 5m, 15m, 1h, 4h, 1d)
+        maybe_tf = args[-1].lower()
+        if maybe_tf.endswith(("m", "h", "d")) and any(ch.isdigit() for ch in maybe_tf):
+            tf = maybe_tf
+            args = args[:-1]
+    if args:
+        pair = " ".join(args).upper()
+
+    pair = pair or (engine.valid_pairs[0] if engine.valid_pairs else PAIRS[0])
+    tf = tf or TIMEFRAME
+
     try:
-        df = await engine.fetch_df(pair)
+        df = await engine.fetch_df(pair, timeframe=tf)
         if df.empty:
-            return await update.message.reply_text(f"No data for {pair}. Try later.")
+            return await update.message.reply_text(f"No data for {pair} on {tf}. Try later.")
+
+        # Compute indicators
         df["sma50"] = df["close"].rolling(50).mean()
         df["sma200"] = df["close"].rolling(200).mean()
-        png = plot_signal_chart(pair, df, None, None)
+        df["rsi"] = engine.rsi(df["close"], 14)
+
+        # Check last candle for a signal
+        mark = None
+        price = None
+        if len(df) >= 2:
+            row, prev = df.iloc[-1], df.iloc[-2]
+            long_cond = (row.sma50 > row.sma200) and (prev.rsi < 45 <= row.rsi)
+            exit_cond = (row.rsi > 65) or (row.sma50 < row.sma200)
+            if long_cond:
+                mark, price = "LONG", float(row["close"])
+            elif exit_cond:
+                mark, price = "EXIT", float(row["close"])
+
+        png = plot_signal_chart(pair, df, mark, price, title_tf=tf)
         if not png:
             return await update.message.reply_text("Could not render chart right now.")
-        await update.message.reply_photo(png, caption=f"{pair} — {TIMEFRAME}")
+
+        caption = f"{pair} — {tf}"
+        if mark == "LONG":
+            caption += "  •  BUY signal"
+        elif mark == "EXIT":
+            caption += "  •  SELL/EXIT signal"
+
+        await update.message.reply_photo(png, caption=caption)
     except Exception as e:
         logging.error("chart error: %s", e)
         await update.message.reply_text("Chart error. Try again shortly.")
