@@ -251,8 +251,17 @@ class Engine:
 # -----------------------------
 # CHARTS (now with timezone & "NOW" line)
 # -----------------------------
-def plot_signal_chart(pair: str, df: pd.DataFrame, mark: str | None, price: float | None, title_tf: str | None = None):
-    """Return a BytesIO PNG of Close + SMA50/200 and optional BUY/SELL marker, displayed in DISPLAY_TZ."""
+def plot_signal_chart(
+    pair: str,
+    df: pd.DataFrame,
+    mark: str | None,
+    price: float | None,
+    title_tf: str | None = None,
+    last_tick: float | None = None,   # ⬅️ NEW: consensus “now” price
+):
+    """Return a PNG of Close + SMA50/200 with optional BUY/SELL marker,
+       displayed in DISPLAY_TZ. If last_tick is provided, overlay it as a
+       'LIVE' dot at the right edge so the chart looks real-time."""
     dfp = df.tail(200).copy()
     if dfp.empty:
         return None
@@ -261,7 +270,6 @@ def plot_signal_chart(pair: str, df: pd.DataFrame, mark: str | None, price: floa
     try:
         dfp["time"] = dfp["time"].dt.tz_convert(DISPLAY_TZ)
     except Exception:
-        # If tz conversion fails, keep UTC silently
         pass
 
     fig, ax = plt.subplots(figsize=(8, 4.5), dpi=140)
@@ -273,19 +281,38 @@ def plot_signal_chart(pair: str, df: pd.DataFrame, mark: str | None, price: floa
     ax.plot(dfp["time"], dfp["sma50"], linewidth=1.0, label="SMA50")
     ax.plot(dfp["time"], dfp["sma200"], linewidth=1.0, label="SMA200")
 
-    # Marker for latest signal
+    # Marker for latest signal (BUY/SELL)
     if mark and price:
-        x = dfp["time"].iloc[-1]
-        y = price
+        x_sig = dfp["time"].iloc[-1]
+        y_sig = price
         label = "BUY" if mark == "LONG" else "SELL"
-        ax.scatter([x], [y], s=50)
-        ax.annotate(label, (x, y), xytext=(10, 10), textcoords="offset points")
+        ax.scatter([x_sig], [y_sig], s=50)
+        ax.annotate(label, (x_sig, y_sig), xytext=(10, 10), textcoords="offset points")
 
-    # "NOW" vertical line at the rightmost timestamp in the data
+    # “NOW” vertical line at last candle’s timestamp (visual alignment)
     try:
-        ax.axvline(dfp["time"].iloc[-1], linewidth=0.7)
+        x_last = dfp["time"].iloc[-1]
+        ax.axvline(x_last, linewidth=0.7)
     except Exception:
-        pass
+        x_last = None
+
+    # ⬇️ NEW: overlay synthetic live tick (consensus price) at the right edge
+    if last_tick and x_last is not None:
+        # Nudge a hair to the right so it’s visually distinct from the last close
+        # (matplotlib treats datetimes; a few seconds offset is enough)
+        try:
+            x_live = x_last + pd.Timedelta(seconds=2)
+        except Exception:
+            x_live = x_last
+        ax.scatter([x_live], [last_tick], s=55)
+        ax.annotate("LIVE", (x_live, last_tick), xytext=(10, -12), textcoords="offset points")
+
+        # Optional: a faint guide from last close to live tick (no color specified)
+        try:
+            last_close = float(dfp["close"].iloc[-1])
+            ax.plot([x_last, x_live], [last_close, last_tick], linewidth=0.8)
+        except Exception:
+            pass
 
     ax.set_title(f"{pair} — {title_tf or TIMEFRAME}  ({DISPLAY_TZ})")
     ax.set_xlabel("Time")
