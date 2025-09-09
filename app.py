@@ -1,10 +1,14 @@
 import os
+import io
 import time
 import asyncio
 import logging
 import sqlite3
 import traceback
 from datetime import datetime, timezone
+
+# Use a headless backend for matplotlib (required on servers)
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -13,6 +17,7 @@ load_dotenv()
 import ccxt
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -21,6 +26,7 @@ from fastapi.responses import JSONResponse
 import uvicorn
 
 from telegram import Update, LabeledPrice
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application, CommandHandler, ContextTypes,
     PreCheckoutQueryHandler, MessageHandler, filters
@@ -30,17 +36,19 @@ from telegram.ext import (
 # ENV
 # -----------------------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-PAIR      = os.getenv("PAIR", "BTC/USDT")
 EXCHANGE  = os.getenv("EXCHANGE", "binanceus")
-TIMEFRAME = os.getenv("TIMEFRAME", "15m")
-STARS_PRICE_XTR = int(os.getenv("STARS_PRICE_XTR", "10000"))   # default ≈ $10
+TIMEFRAME = os.getenv("TIMEFRAME", "1m")            # faster cadence
+PAIR      = os.getenv("PAIR", "BTC/USDT")           # legacy single pair
+PAIRS_ENV = os.getenv("PAIRS", PAIR)                # multiple pairs support
+PAIRS     = [p.strip() for p in PAIRS_ENV.split(",") if p.strip()]
+
+STARS_PRICE_XTR = int(os.getenv("STARS_PRICE_XTR", "10000"))  # ≈ $10
 PUBLIC_URL = os.getenv("PUBLIC_URL")  # e.g. https://your-app.onrender.com
+
+OWNER_ID = int(os.getenv("OWNER_ID", "5467277042"))  # your ID set earlier
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
-
-# ✅ Your Telegram ID (only you can use /grantme)
-OWNER_ID = 5467277042
 
 # -----------------------------
 # SQLITE (built-in)
@@ -85,27 +93,26 @@ def wants(uid: int) -> bool:
     return bool(row[0]) if row else True  # default True
 
 # -----------------------------
-# STRATEGY (pandas + numpy) with guards
+# STRATEGY ENGINE
 # -----------------------------
 class Engine:
-    def __init__(self, exchange_id, pair, timeframe):
+    def __init__(self, exchange_id, timeframe):
         self.ex = getattr(ccxt, exchange_id)({"enableRateLimit": True})
-        self.pair = pair
         self.tf = timeframe
-        self.last = None
+        self.last = {}  # last signal state per pair ("LONG" or "EXIT")
 
-    async def fetch_df(self, limit=300):
+    async def fetch_df(self, pair, limit=300):
         def get_ohlcv():
-            return self.ex.fetch_ohlcv(self.pair, timeframe=self.tf, limit=limit)
+            return self.ex.fetch_ohlcv(pair, timeframe=self.tf, limit=limit)
 
         try:
             ohlcv = await asyncio.to_thread(get_ohlcv)
         except Exception as e:
-            logging.warning("fetch_ohlcv failed: %s", e)
+            logging.warning("fetch_ohlcv failed for %s: %s", pair, e)
             return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
 
         if not ohlcv or len(ohlcv) < 210:
-            logging.info("Not enough candles: %s", len(ohlcv) if ohlcv else 0)
+            logging.info("[%s] Not enough candles: %s", pair, len(ohlcv) if ohlcv else 0)
             return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
 
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
@@ -122,35 +129,107 @@ class Engine:
         rs = roll_up / (roll_down + 1e-9)
         return 100.0 - (100.0 / (1.0 + rs))
 
-    async def signal(self):
-        df = await self.fetch_df()
+    async def analyze(self, pair):
+        df = await self.fetch_df(pair)
         if df.empty or len(df) < 200:
-            return None
+            return None, df
 
         df["sma50"] = df["close"].rolling(50).mean()
         df["sma200"] = df["close"].rolling(200).mean()
         df["rsi"] = self.rsi(df["close"], 14)
 
         row, prev = df.iloc[-1], df.iloc[-2]
-
         long_cond = (row.sma50 > row.sma200) and (prev.rsi < 45 <= row.rsi)
         exit_cond = (row.rsi > 65) or (row.sma50 < row.sma200)
 
-        price = row.close
-        ts = row.time.strftime("%Y-%m-%d %H:%M UTC")
+        price = row["close"]
+        ts = row["time"].strftime("%Y-%m-%d %H:%M UTC")
 
-        if long_cond and self.last != "LONG":
-            self.last = "LONG"
-            return f"LONG {self.pair} @ {price:.2f} [{self.tf}]  ({ts})"
-        if exit_cond and self.last != "EXIT":
-            self.last = "EXIT"
-            return f"EXIT/NEUTRAL {self.pair} @ {price:.2f} [{self.tf}]  ({ts})"
-        return None
-
-engine = Engine(EXCHANGE, PAIR, TIMEFRAME)
+        last_state = self.last.get(pair)
+        if long_cond and last_state != "LONG":
+            self.last[pair] = "LONG"
+            text = f"LONG {pair} @ {price:.2f} [{self.tf}]  ({ts})\nSMA50>SMA200; RSI up-cross from <45."
+            return ("LONG", text, price, ts), df
+        if exit_cond and last_state != "EXIT":
+            self.last[pair] = "EXIT"
+            text = f"EXIT/NEUTRAL {pair} @ {price:.2f} [{self.tf}]  ({ts})\nRSI>65 or SMA50<SMA200."
+            return ("EXIT", text, price, ts), df
+        return None, df
 
 # -----------------------------
-# TELEGRAM HANDLERS
+# CHARTS
+# -----------------------------
+def plot_signal_chart(pair: str, df: pd.DataFrame, mark: str | None, price: float | None):
+    """
+    Returns a BytesIO PNG of close price with SMA50/200 and optional BUY/SELL marker.
+    """
+    # Take the last ~200 bars to keep it readable
+    dfp = df.tail(200).copy()
+    if dfp.empty:
+        return None
+
+    fig, ax = plt.subplots(figsize=(8, 4.5), dpi=140)
+
+    # Price line
+    ax.plot(dfp["time"], dfp["close"], linewidth=1.2, label="Close")
+
+    # SMAs
+    if "sma50" not in dfp:
+        dfp["sma50"] = dfp["close"].rolling(50).mean()
+    if "sma200" not in dfp:
+        dfp["sma200"] = dfp["close"].rolling(200).mean()
+    ax.plot(dfp["time"], dfp["sma50"], linewidth=1.0, label="SMA50")
+    ax.plot(dfp["time"], dfp["sma200"], linewidth=1.0, label="SMA200")
+
+    # Marker
+    if mark and price:
+        x = dfp["time"].iloc[-1]
+        y = price
+        label = "BUY" if mark == "LONG" else "SELL"
+        ax.scatter([x], [y], s=50)
+        ax.annotate(label, (x, y), xytext=(10, 10), textcoords="offset points")
+
+    ax.set_title(f"{pair} — {TIMEFRAME}  (UTC)")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Price")
+    ax.legend(loc="best")
+    ax.grid(True, linewidth=0.3)
+
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+# -----------------------------
+# TELEGRAM HELPERS
+# -----------------------------
+async def broadcast(text: str, app: "Application"):
+    rows = cur.execute(
+        "SELECT user_id FROM users WHERE expires_at > ? AND signals_on = 1",
+        (now_ts(),)
+    ).fetchall()
+    for (uid,) in rows:
+        try:
+            await app.bot.send_message(uid, text)
+        except Exception as e:
+            logging.warning(f"send fail {uid}: {e}")
+
+async def broadcast_chart(app: "Application", caption: str, png_buf: io.BytesIO):
+    rows = cur.execute(
+        "SELECT user_id FROM users WHERE expires_at > ? AND signals_on = 1",
+        (now_ts(),)
+    ).fetchall()
+    for (uid,) in rows:
+        try:
+            await app.bot.send_photo(uid, png_buf, caption=caption)
+            png_buf.seek(0)  # rewind so we can reuse the same buffer for each user
+        except Exception as e:
+            logging.warning(f"send photo fail {uid}: {e}")
+
+# -----------------------------
+# TELEGRAM COMMANDS
 # -----------------------------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_active(update.effective_user.id):
@@ -206,7 +285,7 @@ async def cmd_signalsoff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     set_opt(update.effective_user.id, False)
     await update.message.reply_text("Alerts paused in this chat.")
 
-# ✅ New: Grant yourself free subscription
+# Owner-only: grant free sub
 async def cmd_grantme(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return await update.message.reply_text("⛔ Not authorized.")
@@ -216,34 +295,64 @@ async def cmd_grantme(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     dt = datetime.fromtimestamp(exp, tz=timezone.utc)
     await update.message.reply_text(f"✅ Free subscription granted until {dt:%Y-%m-%d %H:%M UTC}.")
 
-async def broadcast(text: str, app: Application):
-    rows = cur.execute(
-        "SELECT user_id FROM users WHERE expires_at > ? AND signals_on = 1",
-        (now_ts(),)
-    ).fetchall()
-    for (uid,) in rows:
-        try:
-            await app.bot.send_message(uid, text)
-        except Exception as e:
-            logging.warning(f"send fail {uid}: {e}")
+# On-demand chart: "/chart" or "/chart ETH/USDT"
+async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_active(update.effective_user.id):
+        return await update.message.reply_text("Inactive. Use /subscribe or /grantme (owner).")
+
+    pair = " ".join(ctx.args).strip().upper() if ctx.args else PAIRS[0]
+    if pair not in PAIRS:
+        # allow ad-hoc symbol if exchange supports
+        pass
+    try:
+        df = await engine.fetch_df(pair)
+        if df.empty:
+            return await update.message.reply_text(f"No data for {pair}. Try later.")
+        # compute SMAs so chart shows them
+        df["sma50"] = df["close"].rolling(50).mean()
+        df["sma200"] = df["close"].rolling(200).mean()
+        png = plot_signal_chart(pair, df, None, None)
+        if not png:
+            return await update.message.reply_text("Could not render chart right now.")
+        await update.message.reply_photo(png, caption=f"{pair} — {TIMEFRAME}")
+    except Exception as e:
+        logging.error("chart error: %s", e)
+        await update.message.reply_text("Chart error. Try again shortly.")
 
 # -----------------------------
-# SCHEDULER
+# SCHEDULER (1-minute checks, chart on new signals)
 # -----------------------------
-async def scheduled_job(app: Application):
+engine = Engine(EXCHANGE, TIMEFRAME)
+
+async def scheduled_job(app: "Application"):
     try:
-        sig = await engine.signal()
-        if sig:
-            await broadcast(sig, app)
+        for pair in PAIRS:
+            res, df = await engine.analyze(pair)
+            if not res:
+                continue
+            mark, text, price, ts = res
+            # 1) Send text signal
+            await broadcast(text, app)
+            # 2) Send chart with marker
+            try:
+                # ensure SMAs exist if analyze returned early
+                if "sma50" not in df.columns: df["sma50"] = df["close"].rolling(50).mean()
+                if "sma200" not in df.columns: df["sma200"] = df["close"].rolling(200).mean()
+                png = plot_signal_chart(pair, df, mark, price)
+                if png:
+                    await broadcast_chart(app, caption=text, png_buf=png)
+            except Exception as ce:
+                logging.warning("chart send failed: %s", ce)
+        await asyncio.sleep(0.1)
     except Exception as e:
         logging.error("scheduled_job crashed: %s", e)
         logging.error("Traceback:\n%s", traceback.format_exc())
 
-def schedule_jobs(app: Application, scheduler: AsyncIOScheduler):
+def schedule_jobs(app: "Application", scheduler: AsyncIOScheduler):
     scheduler.add_job(
         scheduled_job,
         "interval",
-        minutes=5,
+        minutes=1,  # run every minute
         args=[app],
         next_run_time=datetime.now(timezone.utc)
     )
@@ -252,7 +361,10 @@ def schedule_jobs(app: Application, scheduler: AsyncIOScheduler):
 # FASTAPI + TELEGRAM APP
 # -----------------------------
 logging.basicConfig(level=logging.INFO)
-application = Application.builder().token(BOT_TOKEN).build()
+
+# longer network timeouts to avoid startup failures
+request = HTTPXRequest(connect_timeout=20, read_timeout=30, write_timeout=20, pool_timeout=20)
+application = Application.builder().token(BOT_TOKEN).request(request).build()
 
 # Telegram handlers
 application.add_handler(CommandHandler("start", cmd_start))
@@ -261,7 +373,8 @@ application.add_handler(CommandHandler("status", cmd_status))
 application.add_handler(CommandHandler("cancel", cmd_cancel))
 application.add_handler(CommandHandler("signalson", cmd_signalson))
 application.add_handler(CommandHandler("signalsoff", cmd_signalsoff))
-application.add_handler(CommandHandler("grantme", cmd_grantme))  # only you
+application.add_handler(CommandHandler("grantme", cmd_grantme))
+application.add_handler(CommandHandler("chart", cmd_chart))
 application.add_handler(PreCheckoutQueryHandler(precheckout))
 application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
@@ -295,23 +408,33 @@ async def telegram_webhook(req: Request):
     await application.process_update(update)
     return {"ok": True}
 
-# Lifecycle
 @api.on_event("startup")
 async def on_startup():
-    await application.initialize()
-    await application.start()
+    try:
+        await application.initialize()
+        await application.start()
+    except Exception as e:
+        logging.error("Telegram init/start failed (API still boots): %s", e)
+
     scheduler = AsyncIOScheduler()
     schedule_jobs(application, scheduler)
     scheduler.start()
+
     if PUBLIC_URL:
         url = f"{PUBLIC_URL.rstrip('/')}/webhook"
-        await application.bot.set_webhook(url)
-        logging.info(f"Webhook set to {url}")
+        try:
+            await application.bot.set_webhook(url, timeout=30)
+            logging.info(f"Webhook set to {url}")
+        except Exception as e:
+            logging.warning("Could not set webhook now: %s", e)
 
 @api.on_event("shutdown")
 async def on_shutdown():
-    await application.stop()
-    await application.shutdown()
+    try:
+        await application.stop()
+        await application.shutdown()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     uvicorn.run(api, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
