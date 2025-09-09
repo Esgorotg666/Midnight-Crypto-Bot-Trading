@@ -7,7 +7,7 @@ import sqlite3
 import traceback
 from datetime import datetime, timezone
 
-# Use a headless backend for matplotlib (required on servers)
+# Use a headless backend for matplotlib on servers
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 from dotenv import load_dotenv
@@ -37,7 +37,7 @@ from telegram.ext import (
 # -----------------------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 EXCHANGE  = os.getenv("EXCHANGE", "binanceus")
-TIMEFRAME = os.getenv("TIMEFRAME", "1m")            # faster cadence
+TIMEFRAME = os.getenv("TIMEFRAME", "1m")            # fast cadence
 PAIR      = os.getenv("PAIR", "BTC/USDT")           # legacy single pair
 PAIRS_ENV = os.getenv("PAIRS", PAIR)                # multiple pairs support
 PAIRS     = [p.strip() for p in PAIRS_ENV.split(",") if p.strip()]
@@ -45,7 +45,8 @@ PAIRS     = [p.strip() for p in PAIRS_ENV.split(",") if p.strip()]
 STARS_PRICE_XTR = int(os.getenv("STARS_PRICE_XTR", "10000"))  # ≈ $10
 PUBLIC_URL = os.getenv("PUBLIC_URL")  # e.g. https://your-app.onrender.com
 
-OWNER_ID = int(os.getenv("OWNER_ID", "5467277042"))  # your ID set earlier
+# Owner for /grantme (your numeric Telegram ID)
+OWNER_ID = 5467277042
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
@@ -93,18 +94,40 @@ def wants(uid: int) -> bool:
     return bool(row[0]) if row else True  # default True
 
 # -----------------------------
-# STRATEGY ENGINE
+# STRATEGY ENGINE (multi-pair + valid-pair filtering)
 # -----------------------------
 class Engine:
-    def __init__(self, exchange_id, timeframe):
+    def __init__(self, exchange_id, timeframe, requested_pairs):
         self.ex = getattr(ccxt, exchange_id)({"enableRateLimit": True})
         self.tf = timeframe
-        self.last = {}  # last signal state per pair ("LONG" or "EXIT")
+        self.requested_pairs = requested_pairs
+        self.valid_pairs = []
+        self.last = {}  # remember last signal per pair ("LONG"/"EXIT")
+
+    async def init_markets(self):
+        """Load exchange markets and filter requested pairs to those actually supported."""
+        def _load():
+            self.ex.load_markets()
+            return set(self.ex.symbols or [])
+        try:
+            symbols = await asyncio.to_thread(_load)
+        except Exception as e:
+            logging.warning("Could not load markets for %s: %s", self.ex.id, e)
+            # fallback: try all (fetch_df will guard per pair)
+            self.valid_pairs = list(self.requested_pairs)
+            return
+
+        wanted = set(self.requested_pairs)
+        self.valid_pairs = sorted(list(wanted & symbols))
+        skipped = sorted(list(wanted - symbols))
+        if skipped:
+            logging.info("Skipping unsupported pairs on %s: %s", self.ex.id, ", ".join(skipped))
+        if not self.valid_pairs:
+            logging.warning("No valid pairs found on %s from requested: %s", self.ex.id, ", ".join(self.requested_pairs))
 
     async def fetch_df(self, pair, limit=300):
         def get_ohlcv():
             return self.ex.fetch_ohlcv(pair, timeframe=self.tf, limit=limit)
-
         try:
             ohlcv = await asyncio.to_thread(get_ohlcv)
         except Exception as e:
@@ -160,24 +183,17 @@ class Engine:
 # CHARTS
 # -----------------------------
 def plot_signal_chart(pair: str, df: pd.DataFrame, mark: str | None, price: float | None):
-    """
-    Returns a BytesIO PNG of close price with SMA50/200 and optional BUY/SELL marker.
-    """
-    # Take the last ~200 bars to keep it readable
+    """Return a BytesIO PNG of Close + SMA50/200 and optional BUY/SELL marker."""
     dfp = df.tail(200).copy()
     if dfp.empty:
         return None
 
     fig, ax = plt.subplots(figsize=(8, 4.5), dpi=140)
-
-    # Price line
+    # Price
     ax.plot(dfp["time"], dfp["close"], linewidth=1.2, label="Close")
-
-    # SMAs
-    if "sma50" not in dfp:
-        dfp["sma50"] = dfp["close"].rolling(50).mean()
-    if "sma200" not in dfp:
-        dfp["sma200"] = dfp["close"].rolling(200).mean()
+    # SMAs (ensure present)
+    if "sma50" not in dfp:  dfp["sma50"]  = dfp["close"].rolling(50).mean()
+    if "sma200" not in dfp: dfp["sma200"] = dfp["close"].rolling(200).mean()
     ax.plot(dfp["time"], dfp["sma50"], linewidth=1.0, label="SMA50")
     ax.plot(dfp["time"], dfp["sma200"], linewidth=1.0, label="SMA200")
 
@@ -205,26 +221,24 @@ def plot_signal_chart(pair: str, df: pd.DataFrame, mark: str | None, price: floa
 # -----------------------------
 # TELEGRAM HELPERS
 # -----------------------------
-async def broadcast(text: str, app: "Application"):
-    rows = cur.execute(
+def active_users():
+    return cur.execute(
         "SELECT user_id FROM users WHERE expires_at > ? AND signals_on = 1",
         (now_ts(),)
     ).fetchall()
-    for (uid,) in rows:
+
+async def broadcast(text: str, app: "Application"):
+    for (uid,) in active_users():
         try:
             await app.bot.send_message(uid, text)
         except Exception as e:
             logging.warning(f"send fail {uid}: {e}")
 
 async def broadcast_chart(app: "Application", caption: str, png_buf: io.BytesIO):
-    rows = cur.execute(
-        "SELECT user_id FROM users WHERE expires_at > ? AND signals_on = 1",
-        (now_ts(),)
-    ).fetchall()
-    for (uid,) in rows:
+    for (uid,) in active_users():
         try:
             await app.bot.send_photo(uid, png_buf, caption=caption)
-            png_buf.seek(0)  # rewind so we can reuse the same buffer for each user
+            png_buf.seek(0)  # reuse buffer
         except Exception as e:
             logging.warning(f"send photo fail {uid}: {e}")
 
@@ -298,17 +312,12 @@ async def cmd_grantme(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # On-demand chart: "/chart" or "/chart ETH/USDT"
 async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_active(update.effective_user.id):
-        return await update.message.reply_text("Inactive. Use /subscribe or /grantme (owner).")
-
-    pair = " ".join(ctx.args).strip().upper() if ctx.args else PAIRS[0]
-    if pair not in PAIRS:
-        # allow ad-hoc symbol if exchange supports
-        pass
+        return await update.message.reply_text("Inactive. Use /subscribe.")
+    pair = " ".join(ctx.args).strip().upper() if ctx.args else (engine.valid_pairs[0] if engine.valid_pairs else PAIRS[0])
     try:
         df = await engine.fetch_df(pair)
         if df.empty:
             return await update.message.reply_text(f"No data for {pair}. Try later.")
-        # compute SMAs so chart shows them
         df["sma50"] = df["close"].rolling(50).mean()
         df["sma200"] = df["close"].rolling(200).mean()
         png = plot_signal_chart(pair, df, None, None)
@@ -319,23 +328,33 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         logging.error("chart error: %s", e)
         await update.message.reply_text("Chart error. Try again shortly.")
 
+# Telegram: show requested vs active pairs
+async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    requested = ", ".join(PAIRS) if PAIRS else "(none)"
+    active = ", ".join(engine.valid_pairs) if getattr(engine, "valid_pairs", []) else "(loading… try again in ~10s)"
+    msg = (
+        "📊 Pairs\n"
+        f"• Requested: {requested}\n"
+        f"• Active on {EXCHANGE}: {active}"
+    )
+    await update.message.reply_text(msg)
+
 # -----------------------------
 # SCHEDULER (1-minute checks, chart on new signals)
 # -----------------------------
-engine = Engine(EXCHANGE, TIMEFRAME)
+engine = Engine(EXCHANGE, TIMEFRAME, PAIRS)
 
 async def scheduled_job(app: "Application"):
     try:
-        for pair in PAIRS:
+        for pair in engine.valid_pairs:
             res, df = await engine.analyze(pair)
             if not res:
                 continue
             mark, text, price, ts = res
-            # 1) Send text signal
+            # 1) text signal
             await broadcast(text, app)
-            # 2) Send chart with marker
+            # 2) chart image
             try:
-                # ensure SMAs exist if analyze returned early
                 if "sma50" not in df.columns: df["sma50"] = df["close"].rolling(50).mean()
                 if "sma200" not in df.columns: df["sma200"] = df["close"].rolling(200).mean()
                 png = plot_signal_chart(pair, df, mark, price)
@@ -362,7 +381,7 @@ def schedule_jobs(app: "Application", scheduler: AsyncIOScheduler):
 # -----------------------------
 logging.basicConfig(level=logging.INFO)
 
-# longer network timeouts to avoid startup failures
+# Longer network timeouts to avoid startup failures
 request = HTTPXRequest(connect_timeout=20, read_timeout=30, write_timeout=20, pool_timeout=20)
 application = Application.builder().token(BOT_TOKEN).request(request).build()
 
@@ -375,6 +394,7 @@ application.add_handler(CommandHandler("signalson", cmd_signalson))
 application.add_handler(CommandHandler("signalsoff", cmd_signalsoff))
 application.add_handler(CommandHandler("grantme", cmd_grantme))
 application.add_handler(CommandHandler("chart", cmd_chart))
+application.add_handler(CommandHandler("pairs", cmd_pairs))
 application.add_handler(PreCheckoutQueryHandler(precheckout))
 application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
@@ -384,6 +404,10 @@ api = FastAPI()
 @api.get("/")
 def health():
     return {"ok": True}
+
+@api.get("/pairs")
+def list_pairs():
+    return {"requested": PAIRS, "active_on_exchange": engine.valid_pairs}
 
 @api.get("/runjob")
 async def run_job_now():
@@ -410,11 +434,17 @@ async def telegram_webhook(req: Request):
 
 @api.on_event("startup")
 async def on_startup():
+    # Start Telegram (won't crash app if Telegram is slow)
     try:
         await application.initialize()
         await application.start()
     except Exception as e:
         logging.error("Telegram init/start failed (API still boots): %s", e)
+
+    # Load markets & filter pairs before scheduling
+    await engine.init_markets()
+    if not engine.valid_pairs:
+        logging.warning("No valid pairs; scheduler will start but do nothing until markets load.")
 
     scheduler = AsyncIOScheduler()
     schedule_jobs(application, scheduler)
