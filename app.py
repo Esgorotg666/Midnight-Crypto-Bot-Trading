@@ -476,7 +476,7 @@ async def broadcast(text: str, app: "Application"):
         try: await app.bot.send_message(uid, text)
         except Exception as e: logging.warning(f"send fail {uid}: {e}")
 
-async def _format_pairs_list(pairs: list[str], max_show: int = 40) -> str:
+def _format_pairs_list(pairs: list[str], max_show: int = 40) -> str:
     """Turn a list like ['BTC/USDT', 'ETH/USDT', ...] into wrapped lines for /help."""
     if not pairs:
         return "(none)"
