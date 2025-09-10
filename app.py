@@ -476,6 +476,24 @@ async def broadcast(text: str, app: "Application"):
         try: await app.bot.send_message(uid, text)
         except Exception as e: logging.warning(f"send fail {uid}: {e}")
 
+async def _format_pairs_list(pairs: list[str], max_show: int = 40) -> str:
+    """Turn a list like ['BTC/USDT', 'ETH/USDT', ...] into wrapped lines for /help."""
+    if not pairs:
+        return "(none)"
+    shown = pairs[:max_show]
+    more = len(pairs) - len(shown)
+    lines = []
+    line = []
+    for i, sym in enumerate(shown, 1):
+        line.append(sym)
+        if (i % 8) == 0:  # wrap every 8 symbols for readability
+            lines.append(", ".join(line)); line = []
+    if line:
+        lines.append(", ".join(line))
+    if more > 0:
+        lines.append(f"... and {more} more")
+    return "\n".join(lines)
+
 async def broadcast_chart(app: "Application", caption: str, png_buf: io.BytesIO):
     for (uid,) in active_users():
         try:
