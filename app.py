@@ -10,17 +10,18 @@ from statistics import median
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
-# Use a headless backend for matplotlib on servers
+# Matplotlib headless
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 from dotenv import load_dotenv
 load_dotenv()
 
-# Third-party libs
+# Third-party
 import ccxt
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import httpx
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -34,34 +35,32 @@ from telegram.ext import (
     Application, CommandHandler, ContextTypes,
     PreCheckoutQueryHandler, MessageHandler, filters
 )
-from telegram.error import BadRequest  # for graceful edit fallbacks
+from telegram.error import BadRequest
 
 # -----------------------------
 # ENV
 # -----------------------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-EXCHANGE  = os.getenv("EXCHANGE", "binanceus")   # primary exchange
-TIMEFRAME = os.getenv("TIMEFRAME", "1m")         # default TF
-PAIR      = os.getenv("PAIR", "BTC/USDT")        # legacy single pair
-PAIRS_ENV = os.getenv("PAIRS", PAIR)             # multiple pairs support
+EXCHANGE  = os.getenv("EXCHANGE", "kucoin")      # primary exchange for OHLCV
+TIMEFRAME = os.getenv("TIMEFRAME", "1m")
+PAIR      = os.getenv("PAIR", "BTC/USDT")        # legacy single
+PAIRS_ENV = os.getenv("PAIRS", PAIR)
 PAIRS     = [p.strip() for p in PAIRS_ENV.split(",") if p.strip()]
 
-EXCHANGES_ENV = os.getenv("EXCHANGES", EXCHANGE) # for consensus price
+EXCHANGES_ENV = os.getenv("EXCHANGES", EXCHANGE) # for live consensus
 EX_LIST = [e.strip() for e in EXCHANGES_ENV.split(",") if e.strip()]
 
-DISPLAY_TZ = os.getenv("DISPLAY_TZ", "UTC")      # chart display timezone
+DISPLAY_TZ = os.getenv("DISPLAY_TZ", "UTC")
 
-STARS_PRICE_XTR = int(os.getenv("STARS_PRICE_XTR", "10000"))  # ≈ $10
-PUBLIC_URL = os.getenv("PUBLIC_URL")  # e.g. https://your-app.onrender.com
-
-# Owner for /grantme (your numeric Telegram ID)
+STARS_PRICE_XTR = int(os.getenv("STARS_PRICE_XTR", "10000"))  # ≈$10
+PUBLIC_URL = os.getenv("PUBLIC_URL")
 OWNER_ID = int(os.getenv("OWNER_ID", "5467277042"))
 
 if not BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
 
 # -----------------------------
-# SQLITE (built-in)
+# SQLITE
 # -----------------------------
 DB_PATH = "subs.sqlite"
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -71,8 +70,12 @@ CREATE TABLE IF NOT EXISTS users (
   user_id INTEGER PRIMARY KEY,
   expires_at INTEGER NOT NULL DEFAULT 0,
   signals_on INTEGER NOT NULL DEFAULT 1
-)
-""")
+)""")
+# Pairs table for runtime add/remove
+cur.execute("""
+CREATE TABLE IF NOT EXISTS pairs (
+  symbol TEXT PRIMARY KEY
+)""")
 conn.commit()
 
 def now_ts() -> int:
@@ -98,15 +101,87 @@ def set_opt(uid: int, on: bool):
     """, (uid, 1 if on else 0))
     conn.commit()
 
-def wants(uid: int) -> bool:
-    row = cur.execute("SELECT signals_on FROM users WHERE user_id=?", (uid,)).fetchone()
-    return bool(row[0]) if row else True  # default True
-
 def active_users():
     return cur.execute(
         "SELECT user_id FROM users WHERE expires_at > ? AND signals_on = 1",
         (now_ts(),)
     ).fetchall()
+
+# Pairs helpers
+def db_get_pairs():
+    rows = cur.execute("SELECT symbol FROM pairs ORDER BY symbol").fetchall()
+    return [r[0] for r in rows]
+
+def db_add_pair(sym: str):
+    cur.execute("INSERT OR IGNORE INTO pairs(symbol) VALUES(?)", (sym,))
+    conn.commit()
+
+def db_remove_pair(sym: str):
+    cur.execute("DELETE FROM pairs WHERE symbol=?", (sym,))
+    conn.commit()
+
+# Seed from env if empty
+if not db_get_pairs():
+    for p in PAIRS:
+        db_add_pair(p)
+
+# -----------------------------
+# Uphold: quotes-only client (for consensus)
+# -----------------------------
+class UpholdClient:
+    BASE = "https://api.uphold.com/v0"
+    def __init__(self, timeout=8.0):
+        self.timeout = timeout
+    def map_pair(self, ccxt_pair: str) -> list[str]:
+        try:
+            base, quote = ccxt_pair.split("/")
+        except ValueError:
+            return []
+        cands = []
+        if quote.upper() == "USDT":
+            cands += [f"{base}-USD", f"{base}-USDT"]
+        else:
+            cands.append(f"{base}-{quote}")
+        return cands
+    def _parse_ticker(self, data):
+        if not isinstance(data, dict):
+            return None
+        for k in ("last", "price"):
+            v = data.get(k)
+            if v is not None:
+                try: return float(v)
+                except Exception: pass
+        bid = data.get("bid"); ask = data.get("ask")
+        try:
+            bid = float(bid) if bid is not None else None
+            ask = float(ask) if ask is not None else None
+        except Exception:
+            bid = ask = None
+        if bid is not None and ask is not None:
+            return (bid + ask) / 2.0
+        for v in data.values():
+            try: return float(v)
+            except Exception: continue
+        return None
+    async def fetch_price(self, pair_ccxt: str) -> float | None:
+        cands = self.map_pair(pair_ccxt)
+        if not cands:
+            return None
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            for sym in cands:
+                try:
+                    r = await client.get(f"{self.BASE}/ticker/{sym}")
+                    if r.status_code != 200:
+                        continue
+                    js = r.json()
+                    if isinstance(js, list) and js:
+                        js = js[0]
+                    px = self._parse_ticker(js)
+                    if px and math.isfinite(px):
+                        return float(px)
+                except Exception:
+                    continue
+        return None
 
 # -----------------------------
 # Multi-exchange consensus price
@@ -118,16 +193,20 @@ def _mad(values):
 class MultiPrice:
     def __init__(self, exchange_ids: list[str]):
         self.exes = []
+        self.want_uphold = False
         for ex in exchange_ids:
-            try:
-                self.exes.append(getattr(ccxt, ex)({"enableRateLimit": True}))
-            except Exception:
-                pass
+            if ex.lower() == "uphold":
+                self.want_uphold = True
+            else:
+                try:
+                    self.exes.append(getattr(ccxt, ex)({"enableRateLimit": True}))
+                except Exception:
+                    pass
+        self.uphold = UpholdClient() if self.want_uphold else None
 
     async def get_consensus(self, pair: str):
         async def one(ex):
             def _t():
-                # Prefer fetch_ticker; fallback to last close via OHLCV(1)
                 try:
                     t = ex.fetch_ticker(pair)
                     for key in ("last", "close", "bid", "ask"):
@@ -143,14 +222,25 @@ class MultiPrice:
             return await asyncio.to_thread(_t)
 
         tasks = [one(ex) for ex in self.exes]
+        if self.uphold is not None:
+            async def uphold_task():
+                try: return await self.uphold.fetch_price(pair)
+                except Exception: return None
+            tasks.append(uphold_task())
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         raw, per_ex = [], {}
-        for ex, val in zip(self.exes, results):
+        # map ccxt ones
+        for ex, val in zip(self.exes, results[:len(self.exes)]):
             if isinstance(val, Exception) or val is None or not math.isfinite(val):
                 continue
-            raw.append(val)
-            per_ex[ex.id] = val
+            raw.append(val); per_ex[ex.id] = val
+        # uphold at end
+        if self.uphold is not None:
+            uphold_val = results[-1]
+            if not isinstance(uphold_val, Exception) and uphold_val is not None and math.isfinite(uphold_val):
+                raw.append(float(uphold_val)); per_ex["uphold"] = float(uphold_val)
 
         if not raw:
             return None, 0, None, per_ex
@@ -165,16 +255,14 @@ class MultiPrice:
 price_agg = MultiPrice(EX_LIST)
 
 # -----------------------------
-# LIGHTWEIGHT PREDICTOR HELPERS
+# Predictor helpers
 # -----------------------------
 def _sigmoid(x: float) -> float:
     try:
         if x >= 0:
-            z = math.exp(-x)
-            return 1.0 / (1.0 + z)
+            z = math.exp(-x); return 1.0 / (1.0 + z)
         else:
-            z = math.exp(x)
-            return z / (1.0 + z)
+            z = math.exp(x);  return z / (1.0 + z)
     except OverflowError:
         return 0.0 if x < 0 else 1.0
 
@@ -197,15 +285,11 @@ def _macd(close: pd.Series):
 def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     h, l, c = df["high"], df["low"], df["close"]
     prev_c = c.shift(1)
-    tr = pd.concat([
-        (h - l),
-        (h - prev_c).abs(),
-        (l - prev_c).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([(h-l), (h-prev_c).abs(), (l-prev_c).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
 # -----------------------------
-# STRATEGY ENGINE (multi-pair + valid-pair filtering)
+# Strategy Engine
 # -----------------------------
 class Engine:
     def __init__(self, exchange_id, timeframe, requested_pairs):
@@ -213,8 +297,7 @@ class Engine:
         self.tf = timeframe
         self.requested_pairs = requested_pairs
         self.valid_pairs = []
-        # memory of last TAKE to avoid spamming
-        self.last = {}  # pair -> "LONG"/"EXIT"
+        self.last = {}  # last state per pair
 
     async def init_markets(self):
         def _load():
@@ -226,12 +309,11 @@ class Engine:
             logging.warning("Could not load markets for %s: %s", self.ex.id, e)
             self.valid_pairs = list(self.requested_pairs)
             return
-
         wanted = set(self.requested_pairs)
         self.valid_pairs = sorted(list(wanted & symbols))
         skipped = sorted(list(wanted - symbols))
         if skipped:
-            logging.info("Skipping unsupported pairs on %s: %s", self.ex.id, ", ".join(skipped))
+            logging.info("Skipping unsupported on %s: %s", self.ex.id, ", ".join(skipped))
         if not self.valid_pairs:
             logging.warning("No valid pairs found on %s from requested: %s", self.ex.id, ", ".join(self.requested_pairs))
 
@@ -244,13 +326,11 @@ class Engine:
         except Exception as e:
             logging.warning("fetch_ohlcv failed for %s: %s", pair, e)
             return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
-
         if not ohlcv or len(ohlcv) < 210:
             logging.info("[%s] Not enough candles: %s", pair, len(ohlcv) if ohlcv else 0)
             return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
-
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-        df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)  # tz-aware UTC
+        df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
         return df
 
     @staticmethod
@@ -267,18 +347,14 @@ class Engine:
         df = await self.fetch_df(pair)
         if df.empty or len(df) < 200:
             return None, df
-
         df["sma50"] = df["close"].rolling(50).mean()
         df["sma200"] = df["close"].rolling(200).mean()
         df["rsi"] = self.rsi(df["close"], 14)
-
         row, prev = df.iloc[-1], df.iloc[-2]
         long_cond = (df["sma50"].iloc[-1] > df["sma200"].iloc[-1]) and (prev.rsi < 45 <= row.rsi)
         exit_cond = (row.rsi > 65) or (df["sma50"].iloc[-1] < df["sma200"].iloc[-1])
-
         price = row["close"]
         ts = row["time"].strftime("%Y-%m-%d %H:%M UTC")
-
         last_state = self.last.get(pair)
         if long_cond and last_state != "LONG":
             self.last[pair] = "LONG"
@@ -291,16 +367,10 @@ class Engine:
         return None, df
 
     async def predict(self, pair: str, horizon: int = 5, timeframe: str | None = None):
-        """
-        Return (label, prob_up, explanation, df).
-        label in {"BUY","SELL","HOLD"}; prob_up in [0..1].
-        """
         tf = timeframe or self.tf
         df = await self.fetch_df(pair, timeframe=tf)
         if df.empty or len(df) < 220:
             return None, None, "Not enough data", df
-
-        # Indicators
         df["ret1"]   = df["close"].pct_change()
         df["ret5"]   = df["close"].pct_change(5)
         df["sma20"]  = df["close"].rolling(20).mean()
@@ -314,7 +384,6 @@ class Engine:
         df["atr14"] = _atr(df, 14).fillna(0.0)
         df["rsi"] = self.rsi(df["close"], 14)
 
-        # Normalized features (take last)
         mom_z   = _zscore(df["ret5"]).iloc[-1]
         hist_z  = _zscore(df["macd_hist"]).iloc[-1]
         rsi_d   = (df["rsi"].iloc[-1] - 50.0) / 50.0
@@ -323,7 +392,6 @@ class Engine:
         vol_k   = (df["atr14"].iloc[-1] / (df["close"].iloc[-1] + 1e-9))
         vol_clamped = max(0.05, min(vol_k, 0.20))
 
-        # Weighted blend → score
         score = (
             0.70 * mom_z +
             0.60 * hist_z +
@@ -333,109 +401,69 @@ class Engine:
             0.25 * (vol_clamped - 0.10)
         )
         prob_up = _sigmoid(score)
-
-        if prob_up >= 0.60:
-            label = "BUY"
-        elif prob_up <= 0.40:
-            label = "SELL"
-        else:
-            label = "HOLD"
-
+        if prob_up >= 0.60: label = "BUY"
+        elif prob_up <= 0.40: label = "SELL"
+        else: label = "HOLD"
         explanation = (
             f"mom_z={mom_z:.2f}; macd_z={hist_z:.2f}; rsiΔ={rsi_d:.2f}; "
             f"slope_z={slope_z:.2f}; regime={'bull' if regime>0 else 'bear'}; "
             f"vol={vol_k:.3f}; horizon={horizon} bars"
         )
-
         return (label, float(prob_up), explanation, df)
 
 # -----------------------------
-# CHARTS (timezone, NOW line, LIVE tick with price label)
+# Charts (LIVE dot w/ price label)
 # -----------------------------
-def plot_signal_chart(
-    pair: str,
-    df: pd.DataFrame,
-    mark: str | None,
-    price: float | None,
-    title_tf: str | None = None,
-    last_tick: float | None = None,   # consensus “now” price
-):
-    """Return a PNG of Close + SMA50/200 with optional BUY/SELL marker,
-       displayed in DISPLAY_TZ. If last_tick is provided, overlay it as a
-       'LIVE' dot at the right edge with price label."""
+def plot_signal_chart(pair, df, mark, price, title_tf=None, last_tick=None):
     dfp = df.tail(200).copy()
-    if dfp.empty:
-        return None
-
-    # Convert timestamps to display timezone
+    if dfp.empty: return None
     try:
         dfp["time"] = dfp["time"].dt.tz_convert(DISPLAY_TZ)
     except Exception:
         pass
-
     fig, ax = plt.subplots(figsize=(8, 4.5), dpi=140)
-
-    # Price & SMAs
     ax.plot(dfp["time"], dfp["close"], linewidth=1.2, label="Close")
     if "sma50" not in dfp:  dfp["sma50"]  = dfp["close"].rolling(50).mean()
     if "sma200" not in dfp: dfp["sma200"] = dfp["close"].rolling(200).mean()
     ax.plot(dfp["time"], dfp["sma50"], linewidth=1.0, label="SMA50")
     ax.plot(dfp["time"], dfp["sma200"], linewidth=1.0, label="SMA200")
 
-    # Marker for latest signal (BUY/SELL)
     if mark and price:
-        x_sig = dfp["time"].iloc[-1]
-        y_sig = price
+        x_sig = dfp["time"].iloc[-1]; y_sig = price
         label = "BUY" if mark == "LONG" else "SELL"
-        ax.scatter([x_sig], [y_sig], s=50)
-        ax.annotate(label, (x_sig, y_sig), xytext=(10, 10), textcoords="offset points")
+        ax.scatter([x_sig],[y_sig], s=50)
+        ax.annotate(label, (x_sig,y_sig), xytext=(10,10), textcoords="offset points")
 
-    # “NOW” vertical line at last candle’s timestamp
     try:
         x_last = dfp["time"].iloc[-1]
         ax.axvline(x_last, linewidth=0.7)
     except Exception:
         x_last = None
 
-    # Overlay synthetic LIVE tick (consensus price) with price label
     if last_tick and x_last is not None:
-        try:
-            x_live = x_last + pd.Timedelta(seconds=2)  # nudge right
-        except Exception:
-            x_live = x_last
-        ax.scatter([x_live], [last_tick], s=65, zorder=5)
+        try: x_live = x_last + pd.Timedelta(seconds=2)
+        except Exception: x_live = x_last
+        ax.scatter([x_live],[last_tick], s=65, zorder=5)
         ax.annotate(
-            f"{last_tick:.2f}",
-            (x_live, last_tick),
-            xytext=(0, 12),
-            textcoords="offset points",
-            ha="center",
-            fontsize=8,
-            fontweight="bold",
+            f"{last_tick:.2f}", (x_live,last_tick),
+            xytext=(0,12), textcoords="offset points",
+            ha="center", fontsize=8, fontweight="bold",
             bbox=dict(boxstyle="round,pad=0.2", fc="yellow", alpha=0.7, lw=0)
         )
-        # optional guide from last close to live tick
         try:
             last_close = float(dfp["close"].iloc[-1])
-            ax.plot([x_last, x_live], [last_close, last_tick], linewidth=0.8)
+            ax.plot([x_last,x_live],[last_close,last_tick], linewidth=0.8)
         except Exception:
             pass
 
     ax.set_title(f"{pair} — {title_tf or TIMEFRAME}  ({DISPLAY_TZ})")
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Price")
-    ax.legend(loc="best")
-    ax.grid(True, linewidth=0.3)
-
-    buf = io.BytesIO()
-    fig.tight_layout()
-    fig.savefig(buf, format="png")
-    plt.close(fig)
-    buf.seek(0)
+    ax.set_xlabel("Time"); ax.set_ylabel("Price")
+    ax.legend(loc="best"); ax.grid(True, linewidth=0.3)
+    buf = io.BytesIO(); fig.tight_layout(); fig.savefig(buf, format="png"); plt.close(fig); buf.seek(0)
     return buf
 
 # -----------------------------
-# TELEGRAM HELPERS
+# Telegram helpers
 # -----------------------------
 def tz_label_from_ts(ts, fallback: str) -> str:
     try:
@@ -445,21 +473,19 @@ def tz_label_from_ts(ts, fallback: str) -> str:
 
 async def broadcast(text: str, app: "Application"):
     for (uid,) in active_users():
-        try:
-            await app.bot.send_message(uid, text)
-        except Exception as e:
-            logging.warning(f"send fail {uid}: {e}")
+        try: await app.bot.send_message(uid, text)
+        except Exception as e: logging.warning(f"send fail {uid}: {e}")
 
 async def broadcast_chart(app: "Application", caption: str, png_buf: io.BytesIO):
     for (uid,) in active_users():
         try:
             await app.bot.send_photo(uid, png_buf, caption=caption)
-            png_buf.seek(0)  # reuse buffer
+            png_buf.seek(0)
         except Exception as e:
             logging.warning(f"send photo fail {uid}: {e}")
 
 # -----------------------------
-# TELEGRAM COMMANDS
+# Commands
 # -----------------------------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_active(update.effective_user.id):
@@ -470,16 +496,18 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = (
         "🛠 Commands\n"
-        "/start – Welcome + subscription info\n"
-        "/subscribe – Buy 30-day access with Telegram Stars\n"
+        "/start – Welcome\n"
+        "/subscribe – Buy 30-day access (Stars)\n"
         "/status – Check your expiry\n"
-        "/cancel – Stop auto-renew (access stays until expiry)\n"
-        "/signalson – Enable alerts here\n"
+        "/cancel – Stop auto-renew\n"
+        "/signalson – Enable alerts\n"
         "/signalsoff – Pause alerts\n"
-        "/chart [PAIR] [TF] – Snapshot chart with markers (e.g. /chart, /chart ETH/USDT 5m)\n"
-        "/live [PAIR] [TF] – Auto-refreshing chart ~10s for ~2 min (with LIVE tick)\n"
-        "/predict [PAIR] [TF] [H] – Predict next H bars (default 5)\n"
-        "/pairs – Show requested vs active pairs on the exchange\n"
+        "/chart [PAIR] [TF] – Snapshot chart\n"
+        "/live [PAIR] [TF] – Auto-refresh ~10s for ~2 min\n"
+        "/predict [PAIR] [TF] [H] – BUY/SELL/HOLD next H bars\n"
+        "/pairs or /listpairs – Show requested vs active\n"
+        "/addpair SYMBOL/QUOTE – Add pair (owner)\n"
+        "/removepair SYMBOL/QUOTE – Remove pair (owner)\n"
     )
     if update.effective_user.id == OWNER_ID:
         msg += "\nOwner: /grantme – grant yourself 30 days"
@@ -487,17 +515,14 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     title = "Midnight Crypto Bot Trading – 30 days"
-    desc  = "SMA/RSI crypto signals. Educational only. Not financial advice."
+    desc  = "SMA/RSI signals + predictions. Educational only."
     prices = [LabeledPrice(label="Access (30 days)", amount=STARS_PRICE_XTR)]
     await ctx.bot.send_invoice(
         chat_id=update.effective_chat.id,
-        title=title,
-        description=desc,
+        title=title, description=desc,
         payload=f"sub:{update.effective_user.id}:{now_ts()}",
-        provider_token="",          # empty for Stars
-        currency="XTR",             # Telegram Stars
-        prices=prices,
-        subscription_period=2592000 # 30 days
+        provider_token="", currency="XTR", prices=prices,
+        subscription_period=2592000
     )
 
 async def precheckout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -506,8 +531,7 @@ async def precheckout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sp = update.message.successful_payment
     exp = sp.subscription_expiration_date or (now_ts() + 2592000)
-    set_expiry(update.effective_user.id, exp)
-    set_opt(update.effective_user.id, True)
+    set_expiry(update.effective_user.id, exp); set_opt(update.effective_user.id, True)
     dt = datetime.fromtimestamp(exp, tz=timezone.utc)
     await update.message.reply_text(f"Payment received. Active until {dt:%Y-%m-%d %H:%M UTC}. Use /signalson to enable alerts.")
 
@@ -533,158 +557,153 @@ async def cmd_signalsoff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     set_opt(update.effective_user.id, False)
     await update.message.reply_text("Alerts paused in this chat.")
 
-# Owner-only: grant free sub
 async def cmd_grantme(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return await update.message.reply_text("⛔ Not authorized.")
     exp = now_ts() + 2592000
-    set_expiry(update.effective_user.id, exp)
-    set_opt(update.effective_user.id, True)
+    set_expiry(update.effective_user.id, exp); set_opt(update.effective_user.id, True)
     dt = datetime.fromtimestamp(exp, tz=timezone.utc)
     await update.message.reply_text(f"✅ Free subscription granted until {dt:%Y-%m-%d %H:%M UTC}.")
 
-# /chart – snapshot with markers; optional [PAIR] [TF]
+# Pair management
+async def _refresh_pairs():
+    engine.requested_pairs = db_get_pairs()
+    await engine.init_markets()
+
+async def cmd_addpair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return await update.message.reply_text("⛔ Not authorized.")
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /addpair SYMBOL/QUOTE  (e.g. /addpair HYPE/USDT)")
+    sym = " ".join(ctx.args).upper().strip()
+    db_add_pair(sym); await _refresh_pairs()
+    await update.message.reply_text(f"Added: {sym}\nActive on {EXCHANGE}: {', '.join(engine.valid_pairs) or '(none)'}")
+
+async def cmd_removepair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return await update.message.reply_text("⛔ Not authorized.")
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /removepair SYMBOL/QUOTE")
+    sym = " ".join(ctx.args).upper().strip()
+    db_remove_pair(sym); await _refresh_pairs()
+    await update.message.reply_text(f"Removed: {sym}\nActive on {EXCHANGE}: {', '.join(engine.valid_pairs) or '(none)'}")
+
+async def cmd_listpairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    req = db_get_pairs()
+    active = engine.valid_pairs
+    msg = (
+        "📊 Pairs\n"
+        f"• Requested: {', '.join(req) if req else '(none)'}\n"
+        f"• Active on {EXCHANGE}: {', '.join(active) if active else '(none)'}"
+    )
+    await update.message.reply_text(msg)
+
+# /pairs (alias)
+async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    return await cmd_listpairs(update, ctx)
+
+# Chart command
+async def _pick_default_pair():
+    req = db_get_pairs()
+    if engine.valid_pairs:
+        return engine.valid_pairs[0]
+    return (req[0] if req else "BTC/USDT")
+
 async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_active(update.effective_user.id):
         return await update.message.reply_text("Inactive. Use /subscribe.")
-
     args = [a.strip() for a in ctx.args] if ctx.args else []
-    tf = None
-    pair = None
+    tf = None; pair = None
     if args:
         maybe_tf = args[-1].lower()
         if maybe_tf.endswith(("m","h","d")) and any(ch.isdigit() for ch in maybe_tf):
-            tf = maybe_tf
-            args = args[:-1]
-    if args:
-        pair = " ".join(args).upper()
-
-    pair = pair or (engine.valid_pairs[0] if engine.valid_pairs else PAIRS[0])
+            tf = maybe_tf; args = args[:-1]
+    if args: pair = " ".join(args).upper()
+    pair = pair or await _pick_default_pair()
     tf = tf or TIMEFRAME
-
     try:
         df = await engine.fetch_df(pair, timeframe=tf)
         if df.empty:
             return await update.message.reply_text(f"No data for {pair} on {tf}. Try later.")
-
-        # Indicators
         df["sma50"] = df["close"].rolling(50).mean()
         df["sma200"] = df["close"].rolling(200).mean()
         df["rsi"] = engine.rsi(df["close"], 14)
-
-        # Latest signal
-        mark = None
-        price = None
+        mark = price = None
         if len(df) >= 2:
             row, prev = df.iloc[-1], df.iloc[-2]
             long_cond = (df["sma50"].iloc[-1] > df["sma200"].iloc[-1]) and (prev.rsi < 45 <= row.rsi)
             exit_cond = (row.rsi > 65) or (df["sma50"].iloc[-1] < df["sma200"].iloc[-1])
-            if long_cond:
-                mark, price = "LONG", float(row["close"])
-            elif exit_cond:
-                mark, price = "EXIT", float(row["close"])
-
-        # Consensus + "As of"
+            if long_cond: mark, price = "LONG", float(row["close"])
+            elif exit_cond: mark, price = "EXIT", float(row["close"])
         cons, used, spread, _ = await price_agg.get_consensus(pair)
         asof = df["time"].iloc[-1]
-        try:
-            asof = asof.tz_convert(DISPLAY_TZ)
-        except Exception:
-            pass
-        asof_str = asof.strftime("%Y-%m-%d %H:%M:%S")
-        tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
-
+        try: asof = asof.tz_convert(DISPLAY_TZ)
+        except Exception: pass
+        asof_str = asof.strftime("%Y-%m-%d %H:%M:%S"); tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
         png = plot_signal_chart(pair, df, mark, price, title_tf=tf, last_tick=cons)
-
         caption = f"{pair} — {tf}"
         if mark == "LONG": caption += "  •  BUY signal"
         elif mark == "EXIT": caption += "  •  SELL/EXIT signal"
         caption += f"\nAs of: {asof_str} {tzlab}"
         if cons:
             caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
-            if spread is not None:
-                caption += f" (spread {spread:.2f})"
+            if spread is not None: caption += f" (spread {spread:.2f})"
             caption += f"\nLive tick plotted on chart"
-
         await update.message.reply_photo(png, caption=caption)
     except Exception as e:
         logging.error("chart error: %s", e)
         await update.message.reply_text("Chart error. Try again shortly.")
 
-# /live – refresh chart every ~10s for ~2min (with edit fallback)
+# Live command
 async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_active(update.effective_user.id):
         return await update.message.reply_text("Inactive. Use /subscribe.")
-
     args = [a.strip() for a in ctx.args] if ctx.args else []
-    tf = None
-    pair = None
+    tf = None; pair = None
     if args:
         maybe_tf = args[-1].lower()
-        if (maybe_tf.endswith(("m","h","d")) and any(ch.isdigit() for ch in maybe_tf)):
-            tf = maybe_tf
-            args = args[:-1]
-    if args:
-        pair = " ".join(args).upper()
-
-    pair = pair or (engine.valid_pairs[0] if engine.valid_pairs else PAIRS[0])
+        if maybe_tf.endswith(("m","h","d")) and any(ch.isdigit() for ch in maybe_tf):
+            tf = maybe_tf; args = args[:-1]
+    if args: pair = " ".join(args).upper()
+    pair = pair or await _pick_default_pair()
     tf = tf or TIMEFRAME
-
     status_msg = await update.message.reply_text(f"Starting live chart for {pair} ({tf})…")
     photo_msg = None
-
-    for i in range(12):  # ~2 minutes @ 10s per refresh
+    for _ in range(12):
         try:
             df = await engine.fetch_df(pair, timeframe=tf)
             if df.empty:
-                await status_msg.edit_text(f"No data for {pair} on {tf}.")
-                break
-
+                await status_msg.edit_text(f"No data for {pair} on {tf}."); break
             df["sma50"] = df["close"].rolling(50).mean()
             df["sma200"] = df["close"].rolling(200).mean()
             df["rsi"] = engine.rsi(df["close"], 14)
-
-            mark = None
-            price = None
+            mark = price = None
             if len(df) >= 2:
                 row, prev = df.iloc[-1], df.iloc[-2]
                 long_cond = (df["sma50"].iloc[-1] > df["sma200"].iloc[-1]) and (prev.rsi < 45 <= row.rsi)
                 exit_cond = (row.rsi > 65) or (df["sma50"].iloc[-1] < df["sma200"].iloc[-1])
-                if long_cond:
-                    mark, price = "LONG", float(row["close"])
-                elif exit_cond:
-                    mark, price = "EXIT", float(row["close"])
-
+                if long_cond: mark, price = "LONG", float(row["close"])
+                elif exit_cond: mark, price = "EXIT", float(row["close"])
             cons, used, spread, _ = await price_agg.get_consensus(pair)
             png = plot_signal_chart(pair, df, mark, price, title_tf=tf, last_tick=cons)
-
-            # "As of" time in display TZ + always-changing Updated: line
             asof = df["time"].iloc[-1]
-            try:
-                asof = asof.tz_convert(DISPLAY_TZ)
-            except Exception:
-                pass
-            asof_str = asof.strftime("%Y-%m-%d %H:%M:%S")
-            tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
+            try: asof = asof.tz_convert(DISPLAY_TZ)
+            except Exception: pass
+            asof_str = asof.strftime("%Y-%m-%d %H:%M:%S"); tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
             updated_str = datetime.utcnow().strftime("%H:%M:%S UTC")
-
             caption = f"{pair} — {tf}"
             if mark == "LONG": caption += "  •  BUY"
             elif mark == "EXIT": caption += "  •  SELL/EXIT"
             caption += f"\nAs of: {asof_str} {tzlab}"
             if cons:
                 caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
-                if spread is not None:
-                    caption += f" (spread {spread:.2f})"
+                if spread is not None: caption += f" (spread {spread:.2f})"
                 caption += f"\nLive tick plotted on chart"
             caption += f"\nUpdated: {updated_str}"
-
             if photo_msg is None:
                 photo_msg = await update.message.reply_photo(png, caption=caption)
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
+                try: await status_msg.delete()
+                except Exception: pass
             else:
                 png.seek(0)
                 try:
@@ -707,57 +726,35 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         logging.warning("edit media failed: %s", e)
         except Exception as e:
             logging.warning("live update failed: %s", e)
-
         await asyncio.sleep(10)
+    try: await update.message.reply_text(f"Live session ended for {pair} ({tf}).")
+    except Exception: pass
 
-    try:
-        await update.message.reply_text(f"Live session ended for {pair} ({tf}).")
-    except Exception:
-        pass
-
-# /predict – BUY/SELL/HOLD with confidence, optional [PAIR] [TF] [H]
+# Predict
 async def cmd_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_active(update.effective_user.id):
         return await update.message.reply_text("Inactive. Use /subscribe.")
-
     args = [a.strip() for a in ctx.args] if ctx.args else []
-    pair = None
-    tf = None
-    horizon = 5
-    # Parse like: /predict BTC/USDT 1m 12
-    if args:
-        if args[-1].isdigit():
-            horizon = max(1, min(60, int(args[-1])))
-            args = args[:-1]
+    pair = None; tf = None; horizon = 5
+    if args and args[-1].isdigit():
+        horizon = max(1, min(60, int(args[-1]))); args = args[:-1]
     if args:
         maybe_tf = args[-1].lower()
-        if (maybe_tf.endswith(("m","h","d")) and any(ch.isdigit() for ch in maybe_tf)):
-            tf = maybe_tf
-            args = args[:-1]
-    if args:
-        pair = " ".join(args).upper()
-
-    pair = pair or (engine.valid_pairs[0] if engine.valid_pairs else PAIRS[0])
+        if maybe_tf.endswith(("m","h","d")) and any(ch.isdigit() for ch in maybe_tf):
+            tf = maybe_tf; args = args[:-1]
+    if args: pair = " ".join(args).upper()
+    pair = pair or await _pick_default_pair()
     tf = tf or TIMEFRAME
-
     try:
         label, prob, explanation, df = await engine.predict(pair, horizon=horizon, timeframe=tf)
         if label is None:
             return await update.message.reply_text(f"Not enough data for {pair} on {tf}. Try later.")
-
-        # LIVE consensus for caption and to plot the live dot
         cons, used, spread, _ = await price_agg.get_consensus(pair)
         png = plot_signal_chart(pair, df, mark=None, price=None, title_tf=tf, last_tick=cons)
-
-        # “As of” in display TZ
         asof = df["time"].iloc[-1]
-        try:
-            asof = asof.tz_convert(DISPLAY_TZ)
-        except Exception:
-            pass
-        asof_str = asof.strftime("%Y-%m-%d %H:%M:%S")
-        tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
-
+        try: asof = asof.tz_convert(DISPLAY_TZ)
+        except Exception: pass
+        asof_str = asof.strftime("%Y-%m-%d %H:%M:%S"); tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
         conf = int(round((prob or 0.0) * 100))
         caption = (
             f"🧠 Prediction — {pair} ({tf})\n"
@@ -766,73 +763,47 @@ async def cmd_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"{explanation}"
         )
         if cons:
-            caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
-            if spread is not None:
-                caption += f" (spread {spread:.2f})"
+            caption += f"\nConsensus: {cons:.2f} from {used} exchanges}"
+            if spread is not None: caption += f" (spread {spread:.2f})"
             caption += f"\nLive tick plotted on chart"
-
         await update.message.reply_photo(png, caption=caption)
     except Exception as e:
         logging.error("predict error: %s", e)
         await update.message.reply_text("Prediction error. Try again shortly.")
 
-# Telegram: show requested vs active pairs
-async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    requested = ", ".join(PAIRS) if PAIRS else "(none)"
-    active = ", ".join(engine.valid_pairs) if getattr(engine, "valid_pairs", []) else "(loading… try again in ~10s)"
-    msg = (
-        "📊 Pairs\n"
-        f"• Requested: {requested}\n"
-        f"• Active on {EXCHANGE}: {active}"
-    )
-    await update.message.reply_text(msg)
-
 # -----------------------------
-# SCHEDULER (1-minute checks, chart on new signals)
+# Scheduler
 # -----------------------------
-engine = Engine(EXCHANGE, TIMEFRAME, PAIRS)
+engine = Engine(EXCHANGE, TIMEFRAME, db_get_pairs())
 
 async def scheduled_job(app: "Application"):
     try:
         for pair in engine.valid_pairs:
             res, df = await engine.analyze(pair)
-            if not res:
-                continue
+            if not res: continue
             mark, text, price, ts = res
-            # 1) text signal
             await broadcast(text, app)
-            # 2) chart image with consensus & "As of"
             try:
                 if "sma50" not in df.columns: df["sma50"] = df["close"].rolling(50).mean()
                 if "sma200" not in df.columns: df["sma200"] = df["close"].rolling(200).mean()
                 cons, used, spread, _ = await price_agg.get_consensus(pair)
                 png = plot_signal_chart(pair, df, mark, price, title_tf=None, last_tick=cons)
-
                 asof = df["time"].iloc[-1]
-                try:
-                    asof = asof.tz_convert(DISPLAY_TZ)
-                except Exception:
-                    pass
-                asof_str = asof.strftime("%Y-%m-%d %H:%M:%S")
-                tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
-
+                try: asof = asof.tz_convert(DISPLAY_TZ)
+                except Exception: pass
+                asof_str = asof.strftime("%Y-%m-%d %H:%M:%S"); tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
                 caption = text + f"\nAs of: {asof_str} {tzlab}"
                 if cons:
                     caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
-                    if spread is not None:
-                        caption += f" (spread {spread:.2f})"
+                    if spread is not None: caption += f" (spread {spread:.2f})"
                     caption += f"\nLive tick plotted on chart"
-
-                # OPTIONAL: append model view (uncomment to include on each alert)
+                # OPTIONAL model attachment
                 # try:
                 #     mdl, p, expl, _ = await engine.predict(pair, horizon=5)
                 #     if mdl is not None:
                 #         caption += f"\nModel: {mdl} (P(up)={int(round(p*100))}%) — {expl}"
-                # except Exception:
-                #     pass
-
-                if png:
-                    await broadcast_chart(app, caption=caption, png_buf=png)
+                # except Exception: pass
+                if png: await broadcast_chart(app, caption=caption, png_buf=png)
             except Exception as ce:
                 logging.warning("chart send failed: %s", ce)
         await asyncio.sleep(0.1)
@@ -842,62 +813,43 @@ async def scheduled_job(app: "Application"):
 
 def schedule_jobs(app: "Application", scheduler: AsyncIOScheduler):
     scheduler.add_job(
-        scheduled_job,
-        "interval",
-        minutes=1,  # run every minute
-        args=[app],
+        scheduled_job, "interval",
+        minutes=1, args=[app],
         next_run_time=datetime.now(timezone.utc)
     )
 
 # -----------------------------
-# FASTAPI + TELEGRAM APP (lifespan, no deprecation)
+# FastAPI + PTB
 # -----------------------------
 logging.basicConfig(level=logging.INFO)
-
-# Longer network timeouts to avoid startup failures
 request = HTTPXRequest(connect_timeout=20, read_timeout=30, write_timeout=20, pool_timeout=20)
 application = Application.builder().token(BOT_TOKEN).request(request).build()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     try:
-        await application.initialize()
-        await application.start()
+        await application.initialize(); await application.start()
     except Exception as e:
-        logging.error("Telegram init/start failed (API still boots): %s", e)
-
+        logging.error("Telegram init/start failed: %s", e)
     await engine.init_markets()
-    if not engine.valid_pairs:
-        logging.warning("No valid pairs; scheduler will start but do nothing until markets load.")
-
-    scheduler = AsyncIOScheduler()
-    schedule_jobs(application, scheduler)
-    scheduler.start()
-
+    scheduler = AsyncIOScheduler(); schedule_jobs(application, scheduler); scheduler.start()
     if PUBLIC_URL:
         url = f"{PUBLIC_URL.rstrip('/')}/webhook"
         try:
-            await application.bot.set_webhook(url)  # PTB v21: no timeout arg
+            await application.bot.set_webhook(url)
             logging.info(f"Webhook set to {url}")
         except Exception as e:
             logging.warning("Could not set webhook now: %s", e)
-
-    yield  # -------- App is running --------
-
-    # Shutdown
+    yield
     try:
-        await application.stop()
-        await application.shutdown()
+        await application.stop(); await application.shutdown()
     except Exception:
         pass
 
 api = FastAPI(lifespan=lifespan)
 
-# Routes
 @api.api_route("/", methods=["GET", "HEAD"])
 def health():
-    # For HEAD, FastAPI drops body but returns 200 OK
     return {"ok": True}
 
 @api.get("/robots.txt")
@@ -910,13 +862,12 @@ def favicon():
 
 @api.get("/pairs")
 def list_pairs():
-    return {"requested": PAIRS, "active_on_exchange": engine.valid_pairs}
+    return {"requested": db_get_pairs(), "active_on_exchange": engine.valid_pairs}
 
 @api.get("/runjob")
 async def run_job_now():
     try:
-        await scheduled_job(application)
-        return {"ok": True}
+        await scheduled_job(application); return {"ok": True}
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
@@ -925,7 +876,7 @@ async def set_webhook():
     if not PUBLIC_URL:
         return JSONResponse({"ok": False, "error": "Set PUBLIC_URL env first"}, status_code=400)
     url = f"{PUBLIC_URL.rstrip('/')}/webhook"
-    await application.bot.set_webhook(url)  # PTB v21: no timeout arg
+    await application.bot.set_webhook(url)
     return {"ok": True, "webhook": url}
 
 @api.post("/webhook")
@@ -935,7 +886,7 @@ async def telegram_webhook(req: Request):
     await application.process_update(update)
     return {"ok": True}
 
-# Register Telegram handlers
+# Handlers
 application.add_handler(CommandHandler("start", cmd_start))
 application.add_handler(CommandHandler("help", cmd_help))
 application.add_handler(CommandHandler("subscribe", cmd_subscribe))
@@ -948,6 +899,9 @@ application.add_handler(CommandHandler("chart", cmd_chart))
 application.add_handler(CommandHandler("live", cmd_live))
 application.add_handler(CommandHandler("predict", cmd_predict))
 application.add_handler(CommandHandler("pairs", cmd_pairs))
+application.add_handler(CommandHandler("listpairs", cmd_listpairs))
+application.add_handler(CommandHandler("addpair", cmd_addpair))
+application.add_handler(CommandHandler("removepair", cmd_removepair))
 application.add_handler(PreCheckoutQueryHandler(precheckout))
 application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
