@@ -29,7 +29,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 import uvicorn
 
-from telegram import Update, LabeledPrice, InputMediaPhoto
+from telegram import Update, LabeledPrice, InputMediaPhoto, BotCommand
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application, CommandHandler, ContextTypes,
@@ -231,7 +231,7 @@ class MultiPrice:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         raw, per_ex = [], {}
-        # map ccxt ones
+        # ccxt
         for ex, val in zip(self.exes, results[:len(self.exes)]):
             if isinstance(val, Exception) or val is None or not math.isfinite(val):
                 continue
@@ -296,6 +296,8 @@ class Engine:
         self.ex = getattr(ccxt, exchange_id)({"enableRateLimit": True})
         self.tf = timeframe
         self.requested_pairs = requested_pairs
+        this = self  # no-op to avoid accidental edits
+
         self.valid_pairs = []
         self.last = {}  # last state per pair
 
@@ -476,24 +478,6 @@ async def broadcast(text: str, app: "Application"):
         try: await app.bot.send_message(uid, text)
         except Exception as e: logging.warning(f"send fail {uid}: {e}")
 
-def _format_pairs_list(pairs: list[str], max_show: int = 40) -> str:
-    """Turn a list like ['BTC/USDT', 'ETH/USDT', ...] into wrapped lines for /help."""
-    if not pairs:
-        return "(none)"
-    shown = pairs[:max_show]
-    more = len(pairs) - len(shown)
-    lines = []
-    line = []
-    for i, sym in enumerate(shown, 1):
-        line.append(sym)
-        if (i % 8) == 0:  # wrap every 8 symbols for readability
-            lines.append(", ".join(line)); line = []
-    if line:
-        lines.append(", ".join(line))
-    if more > 0:
-        lines.append(f"... and {more} more")
-    return "\n".join(lines)
-
 async def broadcast_chart(app: "Application", caption: str, png_buf: io.BytesIO):
     for (uid,) in active_users():
         try:
@@ -501,6 +485,42 @@ async def broadcast_chart(app: "Application", caption: str, png_buf: io.BytesIO)
             png_buf.seek(0)
         except Exception as e:
             logging.warning(f"send photo fail {uid}: {e}")
+
+def _format_pairs_list(pairs: list[str], max_show: int = 40) -> str:
+    if not pairs:
+        return "(none)"
+    shown = pairs[:max_show]
+    more = len(pairs) - len(shown)
+    lines, line = [], []
+    for i, sym in enumerate(shown, 1):
+        line.append(sym)
+        if (i % 8) == 0:
+            lines.append(", ".join(line)); line = []
+    if line: lines.append(", ".join(line))
+    if more > 0: lines.append(f"... and {more} more")
+    return "\n".join(lines)
+
+async def set_bot_commands(app: "Application"):
+    cmds = [
+        BotCommand("start", "Welcome & subscription info"),
+        BotCommand("subscribe", "Buy 30-day access (Stars)"),
+        BotCommand("status", "Check your expiry"),
+        BotCommand("cancel", "Stop auto-renew"),
+        BotCommand("signalson", "Enable alerts"),
+        BotCommand("signalsoff", "Pause alerts"),
+        BotCommand("chart", "Chart [PAIR] [TF]"),
+        BotCommand("live", "Live chart [PAIR] [TF]"),
+        BotCommand("predict", "Predict [PAIR] [TF] [H]"),
+        BotCommand("pairs", "Requested vs active pairs"),
+        BotCommand("listpairs", "Alias of /pairs"),
+        BotCommand("addpair", "Owner: add a pair"),
+        BotCommand("removepair", "Owner: remove a pair"),
+        BotCommand("help", "Show commands & available pairs"),
+    ]
+    try:
+        await app.bot.set_my_commands(cmds)
+    except Exception as e:
+        logging.warning(f"set_my_commands failed: {e}")
 
 # -----------------------------
 # Commands
@@ -512,6 +532,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Access requires a sub. Tap /subscribe to pay with Telegram Stars (30 days).")
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    active = engine.valid_pairs or []
+    active_block = _format_pairs_list(active)
     msg = (
         "🛠 Commands\n"
         "/start – Welcome\n"
@@ -520,15 +542,22 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/cancel – Stop auto-renew\n"
         "/signalson – Enable alerts\n"
         "/signalsoff – Pause alerts\n"
-        "/chart [PAIR] [TF] – Snapshot chart\n"
-        "/live [PAIR] [TF] – Auto-refresh ~10s for ~2 min\n"
+        "/chart [PAIR] [TF] – Snapshot chart (ex: /chart BTC/USDT 1m)\n"
+        "/live [PAIR] [TF] – Auto-refresh ~10s for ~2min\n"
         "/predict [PAIR] [TF] [H] – BUY/SELL/HOLD next H bars\n"
-        "/pairs or /listpairs – Show requested vs active\n"
+        "/pairs – Show requested vs active\n"
+        "/listpairs – Same as /pairs\n"
         "/addpair SYMBOL/QUOTE – Add pair (owner)\n"
         "/removepair SYMBOL/QUOTE – Remove pair (owner)\n"
+        "\n"
+        "📈 Available pairs (active on current exchange):\n"
+        f"{active_block}\n"
+        "\n"
+        "Tip: Use /pairs to see both your Requested list and which ones are active.\n"
+        "Owner can add new ones anytime: /addpair HYPE/USDT"
     )
     if update.effective_user.id == OWNER_ID:
-        msg += "\nOwner: /grantme – grant yourself 30 days"
+        msg += "\n\nOwner-only: /grantme – grant yourself 30 days"
     await update.message.reply_text(msg)
 
 async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -608,19 +637,21 @@ async def cmd_removepair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_listpairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     req = db_get_pairs()
-    active = engine.valid_pairs
+    active = engine.valid_pairs or []
     msg = (
         "📊 Pairs\n"
-        f"• Requested: {', '.join(req) if req else '(none)'}\n"
-        f"• Active on {EXCHANGE}: {', '.join(active) if active else '(none)'}"
+        "Active on current exchange:\n"
+        f"{_format_pairs_list(active)}\n\n"
+        "Requested list (DB):\n"
+        f"{_format_pairs_list(req)}"
     )
     await update.message.reply_text(msg)
 
-# /pairs (alias)
+# Alias
 async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return await cmd_listpairs(update, ctx)
 
-# Chart command
+# Chart
 async def _pick_default_pair():
     req = db_get_pairs()
     if engine.valid_pairs:
@@ -672,7 +703,7 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         logging.error("chart error: %s", e)
         await update.message.reply_text("Chart error. Try again shortly.")
 
-# Live command
+# Live
 async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_active(update.effective_user.id):
         return await update.message.reply_text("Inactive. Use /subscribe.")
@@ -849,12 +880,15 @@ async def lifespan(app: FastAPI):
         await application.initialize(); await application.start()
     except Exception as e:
         logging.error("Telegram init/start failed: %s", e)
+
     await engine.init_markets()
+    await set_bot_commands(application)  # set Telegram menu
+
     scheduler = AsyncIOScheduler(); schedule_jobs(application, scheduler); scheduler.start()
     if PUBLIC_URL:
         url = f"{PUBLIC_URL.rstrip('/')}/webhook"
         try:
-            await application.bot.set_webhook(url)
+            await application.bot.set_webhook(url)  # PTB v21: no timeout arg
             logging.info(f"Webhook set to {url}")
         except Exception as e:
             logging.warning("Could not set webhook now: %s", e)
