@@ -21,6 +21,7 @@ import ccxt
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import httpx
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -37,6 +38,8 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest
 
+from zoneinfo import ZoneInfo
+
 # -----------------------------
 # ENV
 # -----------------------------
@@ -51,6 +54,7 @@ EXCHANGES_ENV = os.getenv("EXCHANGES", EXCHANGE) # for live consensus
 EX_LIST = [e.strip() for e in EXCHANGES_ENV.split(",") if e.strip()]
 
 DISPLAY_TZ = os.getenv("DISPLAY_TZ", "UTC")
+LOCAL_TZ = ZoneInfo(DISPLAY_TZ)
 
 STARS_PRICE_XTR = int(os.getenv("STARS_PRICE_XTR", "10000"))  # ≈$10
 PUBLIC_URL = os.getenv("PUBLIC_URL")
@@ -255,7 +259,7 @@ class MultiPrice:
 price_agg = MultiPrice(EX_LIST)
 
 # -----------------------------
-# Predictor helpers
+# Predictor & utilities
 # -----------------------------
 def _sigmoid(x: float) -> float:
     try:
@@ -288,6 +292,18 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr = pd.concat([(h-l), (h-prev_c).abs(), (l-prev_c).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
+def _tf_seconds(tf: str) -> int:
+    tf = (tf or "1m").lower()
+    if tf.endswith("m"): return int(tf[:-1]) * 60
+    if tf.endswith("h"): return int(tf[:-1]) * 3600
+    if tf.endswith("d"): return int(tf[:-1]) * 86400
+    return 60
+
+def _is_stale(last_dt_local: pd.Timestamp, tf: str) -> bool:
+    now_local = pd.Timestamp.now(tz=LOCAL_TZ)
+    age = (now_local - last_dt_local).total_seconds()
+    return age > (2 * _tf_seconds(tf))  # older than 2 bars => stale
+
 # -----------------------------
 # Strategy Engine
 # -----------------------------
@@ -296,8 +312,6 @@ class Engine:
         self.ex = getattr(ccxt, exchange_id)({"enableRateLimit": True})
         self.tf = timeframe
         self.requested_pairs = requested_pairs
-        this = self  # no-op to avoid accidental edits
-
         self.valid_pairs = []
         self.last = {}  # last state per pair
 
@@ -332,7 +346,8 @@ class Engine:
             logging.info("[%s] Not enough candles: %s", pair, len(ohlcv) if ohlcv else 0)
             return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-        df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        # Make timezone-aware UTC, then convert ONCE to local tz
+        df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert(LOCAL_TZ)
         return df
 
     @staticmethod
@@ -356,7 +371,7 @@ class Engine:
         long_cond = (df["sma50"].iloc[-1] > df["sma200"].iloc[-1]) and (prev.rsi < 45 <= row.rsi)
         exit_cond = (row.rsi > 65) or (df["sma50"].iloc[-1] < df["sma200"].iloc[-1])
         price = row["close"]
-        ts = row["time"].strftime("%Y-%m-%d %H:%M UTC")
+        ts = row["time"].strftime("%Y-%m-%d %H:%M %Z")
         last_state = self.last.get(pair)
         if long_cond and last_state != "LONG":
             self.last[pair] = "LONG"
@@ -414,15 +429,12 @@ class Engine:
         return (label, float(prob_up), explanation, df)
 
 # -----------------------------
-# Charts (LIVE dot w/ price label)
+# Charts (LIVE dot w/ price label; local tz x-axis)
 # -----------------------------
 def plot_signal_chart(pair, df, mark, price, title_tf=None, last_tick=None):
     dfp = df.tail(200).copy()
     if dfp.empty: return None
-    try:
-        dfp["time"] = dfp["time"].dt.tz_convert(DISPLAY_TZ)
-    except Exception:
-        pass
+
     fig, ax = plt.subplots(figsize=(8, 4.5), dpi=140)
     ax.plot(dfp["time"], dfp["close"], linewidth=1.2, label="Close")
     if "sma50" not in dfp:  dfp["sma50"]  = dfp["close"].rolling(50).mean()
@@ -436,13 +448,11 @@ def plot_signal_chart(pair, df, mark, price, title_tf=None, last_tick=None):
         ax.scatter([x_sig],[y_sig], s=50)
         ax.annotate(label, (x_sig,y_sig), xytext=(10,10), textcoords="offset points")
 
-    try:
-        x_last = dfp["time"].iloc[-1]
-        ax.axvline(x_last, linewidth=0.7)
-    except Exception:
-        x_last = None
+    x_last = dfp["time"].iloc[-1]
+    ax.axvline(x_last, linewidth=0.7)
 
-    if last_tick and x_last is not None:
+    if last_tick is not None:
+        # show a "live" dot slightly to the right of last closed bar
         try: x_live = x_last + pd.Timedelta(seconds=2)
         except Exception: x_live = x_last
         ax.scatter([x_live],[last_tick], s=65, zorder=5)
@@ -461,18 +471,18 @@ def plot_signal_chart(pair, df, mark, price, title_tf=None, last_tick=None):
     ax.set_title(f"{pair} — {title_tf or TIMEFRAME}  ({DISPLAY_TZ})")
     ax.set_xlabel("Time"); ax.set_ylabel("Price")
     ax.legend(loc="best"); ax.grid(True, linewidth=0.3)
+
+    # Force x-axis labels to local tz format
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M\n%m-%d", tz=LOCAL_TZ))
+    for lbl in ax.get_xticklabels():
+        lbl.set_rotation(0)
+
     buf = io.BytesIO(); fig.tight_layout(); fig.savefig(buf, format="png"); plt.close(fig); buf.seek(0)
     return buf
 
 # -----------------------------
 # Telegram helpers
 # -----------------------------
-def tz_label_from_ts(ts, fallback: str) -> str:
-    try:
-        return getattr(getattr(ts, "tz", None), "key", None) or ts.tzname() or fallback
-    except Exception:
-        return fallback
-
 async def broadcast(text: str, app: "Application"):
     for (uid,) in active_users():
         try: await app.bot.send_message(uid, text)
@@ -521,6 +531,12 @@ async def set_bot_commands(app: "Application"):
         await app.bot.set_my_commands(cmds)
     except Exception as e:
         logging.warning(f"set_my_commands failed: {e}")
+
+def tz_label_from_ts(ts: pd.Timestamp) -> str:
+    try:
+        return ts.tzname() or DISPLAY_TZ
+    except Exception:
+        return DISPLAY_TZ
 
 # -----------------------------
 # Commands
@@ -579,15 +595,15 @@ async def successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sp = update.message.successful_payment
     exp = sp.subscription_expiration_date or (now_ts() + 2592000)
     set_expiry(update.effective_user.id, exp); set_opt(update.effective_user.id, True)
-    dt = datetime.fromtimestamp(exp, tz=timezone.utc)
-    await update.message.reply_text(f"Payment received. Active until {dt:%Y-%m-%d %H:%M UTC}. Use /signalson to enable alerts.")
+    dt = datetime.fromtimestamp(exp, tz=timezone.utc).astimezone(LOCAL_TZ)
+    await update.message.reply_text(f"Payment received. Active until {dt:%Y-%m-%d %H:%M %Z}. Use /signalson to enable alerts.")
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     row = cur.execute("SELECT expires_at FROM users WHERE user_id=?", (uid,)).fetchone()
     if row and row[0] > now_ts():
-        dt = datetime.fromtimestamp(row[0], tz=timezone.utc)
-        await update.message.reply_text(f"Active. Expires {dt:%Y-%m-%d %H:%M UTC}.")
+        dt = datetime.fromtimestamp(row[0], tz=timezone.utc).astimezone(LOCAL_TZ)
+        await update.message.reply_text(f"Active. Expires {dt:%Y-%m-%d %H:%M %Z}.")
     else:
         await update.message.reply_text("Inactive. Use /subscribe.")
 
@@ -609,8 +625,8 @@ async def cmd_grantme(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("⛔ Not authorized.")
     exp = now_ts() + 2592000
     set_expiry(update.effective_user.id, exp); set_opt(update.effective_user.id, True)
-    dt = datetime.fromtimestamp(exp, tz=timezone.utc)
-    await update.message.reply_text(f"✅ Free subscription granted until {dt:%Y-%m-%d %H:%M UTC}.")
+    dt = datetime.fromtimestamp(exp, tz=timezone.utc).astimezone(LOCAL_TZ)
+    await update.message.reply_text(f"✅ Free subscription granted until {dt:%Y-%m-%d %H:%M %Z}.")
 
 # Pair management
 async def _refresh_pairs():
@@ -685,19 +701,20 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if long_cond: mark, price = "LONG", float(row["close"])
             elif exit_cond: mark, price = "EXIT", float(row["close"])
         cons, used, spread, _ = await price_agg.get_consensus(pair)
-        asof = df["time"].iloc[-1]
-        try: asof = asof.tz_convert(DISPLAY_TZ)
-        except Exception: pass
-        asof_str = asof.strftime("%Y-%m-%d %H:%M:%S"); tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
+        last_dt = df["time"].iloc[-1]
+        stale = _is_stale(last_dt, tf)
+        asof_str = last_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
         png = plot_signal_chart(pair, df, mark, price, title_tf=tf, last_tick=cons)
         caption = f"{pair} — {tf}"
         if mark == "LONG": caption += "  •  BUY signal"
         elif mark == "EXIT": caption += "  •  SELL/EXIT signal"
-        caption += f"\nAs of: {asof_str} {tzlab}"
-        if cons:
+        caption += f"\nAs of: {asof_str}"
+        if cons is not None:
             caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
             if spread is not None: caption += f" (spread {spread:.2f})"
             caption += f"\nLive tick plotted on chart"
+        if stale:
+            caption += "\n⚠️ Feed looks stale (no new closed candles yet)."
         await update.message.reply_photo(png, caption=caption)
     except Exception as e:
         logging.error("chart error: %s", e)
@@ -735,20 +752,21 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 elif exit_cond: mark, price = "EXIT", float(row["close"])
             cons, used, spread, _ = await price_agg.get_consensus(pair)
             png = plot_signal_chart(pair, df, mark, price, title_tf=tf, last_tick=cons)
-            asof = df["time"].iloc[-1]
-            try: asof = asof.tz_convert(DISPLAY_TZ)
-            except Exception: pass
-            asof_str = asof.strftime("%Y-%m-%d %H:%M:%S"); tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
-            updated_str = datetime.utcnow().strftime("%H:%M:%S UTC")
+            last_dt = df["time"].iloc[-1]
+            stale = _is_stale(last_dt, tf)
+            asof_str = last_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+            updated_str = pd.Timestamp.now(tz=LOCAL_TZ).strftime("%H:%M:%S %Z")
             caption = f"{pair} — {tf}"
             if mark == "LONG": caption += "  •  BUY"
             elif mark == "EXIT": caption += "  •  SELL/EXIT"
-            caption += f"\nAs of: {asof_str} {tzlab}"
-            if cons:
+            caption += f"\nAs of: {asof_str}"
+            if cons is not None:
                 caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
                 if spread is not None: caption += f" (spread {spread:.2f})"
                 caption += f"\nLive tick plotted on chart"
             caption += f"\nUpdated: {updated_str}"
+            if stale:
+                caption += "\n⚠️ Feed looks stale (no new closed candles yet)."
             if photo_msg is None:
                 photo_msg = await update.message.reply_photo(png, caption=caption)
                 try: await status_msg.delete()
@@ -800,18 +818,16 @@ async def cmd_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text(f"Not enough data for {pair} on {tf}. Try later.")
         cons, used, spread, _ = await price_agg.get_consensus(pair)
         png = plot_signal_chart(pair, df, mark=None, price=None, title_tf=tf, last_tick=cons)
-        asof = df["time"].iloc[-1]
-        try: asof = asof.tz_convert(DISPLAY_TZ)
-        except Exception: pass
-        asof_str = asof.strftime("%Y-%m-%d %H:%M:%S"); tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
+        last_dt = df["time"].iloc[-1]
+        asof_str = last_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
         conf = int(round((prob or 0.0) * 100))
         caption = (
             f"🧠 Prediction — {pair} ({tf})\n"
             f"Next {horizon} bars: {label}  (P(up)={conf}%)\n"
-            f"As of: {asof_str} {tzlab}\n"
+            f"As of: {asof_str}\n"
             f"{explanation}"
         )
-        if cons:
+        if cons is not None:
             caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
             if spread is not None: caption += f" (spread {spread:.2f})"
             caption += f"\nLive tick plotted on chart"
@@ -837,21 +853,13 @@ async def scheduled_job(app: "Application"):
                 if "sma200" not in df.columns: df["sma200"] = df["close"].rolling(200).mean()
                 cons, used, spread, _ = await price_agg.get_consensus(pair)
                 png = plot_signal_chart(pair, df, mark, price, title_tf=None, last_tick=cons)
-                asof = df["time"].iloc[-1]
-                try: asof = asof.tz_convert(DISPLAY_TZ)
-                except Exception: pass
-                asof_str = asof.strftime("%Y-%m-%d %H:%M:%S"); tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
-                caption = text + f"\nAs of: {asof_str} {tzlab}"
-                if cons:
+                last_dt = df["time"].iloc[-1]
+                asof_str = last_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+                caption = text + f"\nAs of: {asof_str}"
+                if cons is not None:
                     caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
                     if spread is not None: caption += f" (spread {spread:.2f})"
                     caption += f"\nLive tick plotted on chart"
-                # OPTIONAL model attachment
-                # try:
-                #     mdl, p, expl, _ = await engine.predict(pair, horizon=5)
-                #     if mdl is not None:
-                #         caption += f"\nModel: {mdl} (P(up)={int(round(p*100))}%) — {expl}"
-                # except Exception: pass
                 if png: await broadcast_chart(app, caption=caption, png_buf=png)
             except Exception as ce:
                 logging.warning("chart send failed: %s", ce)
