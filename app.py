@@ -763,7 +763,7 @@ async def cmd_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"{explanation}"
         )
         if cons:
-            caption += f"\nConsensus: {cons:.2f} from {used} exchanges}"
+            caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
             if spread is not None: caption += f" (spread {spread:.2f})"
             caption += f"\nLive tick plotted on chart"
         await update.message.reply_photo(png, caption=caption)
