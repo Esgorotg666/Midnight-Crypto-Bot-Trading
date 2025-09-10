@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 import uvicorn
 
@@ -165,6 +165,46 @@ class MultiPrice:
 price_agg = MultiPrice(EX_LIST)
 
 # -----------------------------
+# LIGHTWEIGHT PREDICTOR HELPERS
+# -----------------------------
+def _sigmoid(x: float) -> float:
+    try:
+        if x >= 0:
+            z = math.exp(-x)
+            return 1.0 / (1.0 + z)
+        else:
+            z = math.exp(x)
+            return z / (1.0 + z)
+    except OverflowError:
+        return 0.0 if x < 0 else 1.0
+
+def _zscore(series: pd.Series) -> pd.Series:
+    m = series.rolling(200).mean()
+    s = series.rolling(200).std(ddof=0).replace(0, 1e-9)
+    return (series - m) / s
+
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def _macd(close: pd.Series):
+    ema12 = _ema(close, 12)
+    ema26 = _ema(close, 26)
+    macd = ema12 - ema26
+    signal = _ema(macd, 9)
+    hist = macd - signal
+    return macd, signal, hist
+
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    prev_c = c.shift(1)
+    tr = pd.concat([
+        (h - l),
+        (h - prev_c).abs(),
+        (l - prev_c).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+# -----------------------------
 # STRATEGY ENGINE (multi-pair + valid-pair filtering)
 # -----------------------------
 class Engine:
@@ -173,7 +213,8 @@ class Engine:
         self.tf = timeframe
         self.requested_pairs = requested_pairs
         self.valid_pairs = []
-        self.last = {}  # remember last signal per pair ("LONG"/"EXIT")
+        # memory of last TAKE to avoid spamming
+        self.last = {}  # pair -> "LONG"/"EXIT"
 
     async def init_markets(self):
         def _load():
@@ -232,8 +273,8 @@ class Engine:
         df["rsi"] = self.rsi(df["close"], 14)
 
         row, prev = df.iloc[-1], df.iloc[-2]
-        long_cond = (row.sma50 > row.sma200) and (prev.rsi < 45 <= row.rsi)
-        exit_cond = (row.rsi > 65) or (row.sma50 < row.sma200)
+        long_cond = (df["sma50"].iloc[-1] > df["sma200"].iloc[-1]) and (prev.rsi < 45 <= row.rsi)
+        exit_cond = (row.rsi > 65) or (df["sma50"].iloc[-1] < df["sma200"].iloc[-1])
 
         price = row["close"]
         ts = row["time"].strftime("%Y-%m-%d %H:%M UTC")
@@ -248,6 +289,65 @@ class Engine:
             text = f"EXIT/NEUTRAL {pair} @ {price:.2f} [{self.tf}]  ({ts})\nRSI>65 or SMA50<SMA200."
             return ("EXIT", text, price, ts), df
         return None, df
+
+    async def predict(self, pair: str, horizon: int = 5, timeframe: str | None = None):
+        """
+        Return (label, prob_up, explanation, df).
+        label in {"BUY","SELL","HOLD"}; prob_up in [0..1].
+        """
+        tf = timeframe or self.tf
+        df = await self.fetch_df(pair, timeframe=tf)
+        if df.empty or len(df) < 220:
+            return None, None, "Not enough data", df
+
+        # Indicators
+        df["ret1"]   = df["close"].pct_change()
+        df["ret5"]   = df["close"].pct_change(5)
+        df["sma20"]  = df["close"].rolling(20).mean()
+        df["sma50"]  = df["close"].rolling(50).mean()
+        df["sma200"] = df["close"].rolling(200).mean()
+        df["slope20"]  = df["sma20"].diff()
+        df["slope50"]  = df["sma50"].diff()
+        df["slope200"] = df["sma200"].diff()
+        macd, sig, hist = _macd(df["close"])
+        df["macd_hist"] = hist
+        df["atr14"] = _atr(df, 14).fillna(0.0)
+        df["rsi"] = self.rsi(df["close"], 14)
+
+        # Normalized features (take last)
+        mom_z   = _zscore(df["ret5"]).iloc[-1]
+        hist_z  = _zscore(df["macd_hist"]).iloc[-1]
+        rsi_d   = (df["rsi"].iloc[-1] - 50.0) / 50.0
+        slope_z = _zscore(df["slope20"]).iloc[-1]
+        regime  = 1.0 if df["sma50"].iloc[-1] > df["sma200"].iloc[-1] else -1.0
+        vol_k   = (df["atr14"].iloc[-1] / (df["close"].iloc[-1] + 1e-9))
+        vol_clamped = max(0.05, min(vol_k, 0.20))
+
+        # Weighted blend → score
+        score = (
+            0.70 * mom_z +
+            0.60 * hist_z +
+            0.50 * rsi_d +
+            0.40 * slope_z +
+            0.35 * regime -
+            0.25 * (vol_clamped - 0.10)
+        )
+        prob_up = _sigmoid(score)
+
+        if prob_up >= 0.60:
+            label = "BUY"
+        elif prob_up <= 0.40:
+            label = "SELL"
+        else:
+            label = "HOLD"
+
+        explanation = (
+            f"mom_z={mom_z:.2f}; macd_z={hist_z:.2f}; rsiΔ={rsi_d:.2f}; "
+            f"slope_z={slope_z:.2f}; regime={'bull' if regime>0 else 'bear'}; "
+            f"vol={vol_k:.3f}; horizon={horizon} bars"
+        )
+
+        return (label, float(prob_up), explanation, df)
 
 # -----------------------------
 # CHARTS (timezone, NOW line, LIVE tick with price label)
@@ -377,7 +477,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/signalson – Enable alerts here\n"
         "/signalsoff – Pause alerts\n"
         "/chart [PAIR] [TF] – Snapshot chart with markers (e.g. /chart, /chart ETH/USDT 5m)\n"
-        "/live [PAIR] [TF] – Auto-refreshing chart every ~10s for ~2 min (with LIVE tick)\n"
+        "/live [PAIR] [TF] – Auto-refreshing chart ~10s for ~2 min (with LIVE tick)\n"
+        "/predict [PAIR] [TF] [H] – Predict next H bars (default 5)\n"
         "/pairs – Show requested vs active pairs on the exchange\n"
     )
     if update.effective_user.id == OWNER_ID:
@@ -476,8 +577,8 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         price = None
         if len(df) >= 2:
             row, prev = df.iloc[-1], df.iloc[-2]
-            long_cond = (row.sma50 > row.sma200) and (prev.rsi < 45 <= row.rsi)
-            exit_cond = (row.rsi > 65) or (row.sma50 < row.sma200)
+            long_cond = (df["sma50"].iloc[-1] > df["sma200"].iloc[-1]) and (prev.rsi < 45 <= row.rsi)
+            exit_cond = (row.rsi > 65) or (df["sma50"].iloc[-1] < df["sma200"].iloc[-1])
             if long_cond:
                 mark, price = "LONG", float(row["close"])
             elif exit_cond:
@@ -547,8 +648,8 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             price = None
             if len(df) >= 2:
                 row, prev = df.iloc[-1], df.iloc[-2]
-                long_cond = (row.sma50 > row.sma200) and (prev.rsi < 45 <= row.rsi)
-                exit_cond = (row.rsi > 65) or (row.sma50 < row.sma200)
+                long_cond = (df["sma50"].iloc[-1] > df["sma200"].iloc[-1]) and (prev.rsi < 45 <= row.rsi)
+                exit_cond = (row.rsi > 65) or (df["sma50"].iloc[-1] < df["sma200"].iloc[-1])
                 if long_cond:
                     mark, price = "LONG", float(row["close"])
                 elif exit_cond:
@@ -594,7 +695,6 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     )
                 except BadRequest as e:
                     if "Message is not modified" in str(e):
-                        # Force a caption update if media considered same
                         try:
                             await ctx.bot.edit_message_caption(
                                 chat_id=photo_msg.chat_id,
@@ -614,6 +714,67 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Live session ended for {pair} ({tf}).")
     except Exception:
         pass
+
+# /predict – BUY/SELL/HOLD with confidence, optional [PAIR] [TF] [H]
+async def cmd_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_active(update.effective_user.id):
+        return await update.message.reply_text("Inactive. Use /subscribe.")
+
+    args = [a.strip() for a in ctx.args] if ctx.args else []
+    pair = None
+    tf = None
+    horizon = 5
+    # Parse like: /predict BTC/USDT 1m 12
+    if args:
+        if args[-1].isdigit():
+            horizon = max(1, min(60, int(args[-1])))
+            args = args[:-1]
+    if args:
+        maybe_tf = args[-1].lower()
+        if (maybe_tf.endswith(("m","h","d")) and any(ch.isdigit() for ch in maybe_tf)):
+            tf = maybe_tf
+            args = args[:-1]
+    if args:
+        pair = " ".join(args).upper()
+
+    pair = pair or (engine.valid_pairs[0] if engine.valid_pairs else PAIRS[0])
+    tf = tf or TIMEFRAME
+
+    try:
+        label, prob, explanation, df = await engine.predict(pair, horizon=horizon, timeframe=tf)
+        if label is None:
+            return await update.message.reply_text(f"Not enough data for {pair} on {tf}. Try later.")
+
+        # LIVE consensus for caption and to plot the live dot
+        cons, used, spread, _ = await price_agg.get_consensus(pair)
+        png = plot_signal_chart(pair, df, mark=None, price=None, title_tf=tf, last_tick=cons)
+
+        # “As of” in display TZ
+        asof = df["time"].iloc[-1]
+        try:
+            asof = asof.tz_convert(DISPLAY_TZ)
+        except Exception:
+            pass
+        asof_str = asof.strftime("%Y-%m-%d %H:%M:%S")
+        tzlab = tz_label_from_ts(asof, DISPLAY_TZ)
+
+        conf = int(round((prob or 0.0) * 100))
+        caption = (
+            f"🧠 Prediction — {pair} ({tf})\n"
+            f"Next {horizon} bars: {label}  (P(up)={conf}%)\n"
+            f"As of: {asof_str} {tzlab}\n"
+            f"{explanation}"
+        )
+        if cons:
+            caption += f"\nConsensus: {cons:.2f} from {used} exchanges"
+            if spread is not None:
+                caption += f" (spread {spread:.2f})"
+            caption += f"\nLive tick plotted on chart"
+
+        await update.message.reply_photo(png, caption=caption)
+    except Exception as e:
+        logging.error("predict error: %s", e)
+        await update.message.reply_text("Prediction error. Try again shortly.")
 
 # Telegram: show requested vs active pairs
 async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -661,6 +822,14 @@ async def scheduled_job(app: "Application"):
                     if spread is not None:
                         caption += f" (spread {spread:.2f})"
                     caption += f"\nLive tick plotted on chart"
+
+                # OPTIONAL: append model view (uncomment to include on each alert)
+                # try:
+                #     mdl, p, expl, _ = await engine.predict(pair, horizon=5)
+                #     if mdl is not None:
+                #         caption += f"\nModel: {mdl} (P(up)={int(round(p*100))}%) — {expl}"
+                # except Exception:
+                #     pass
 
                 if png:
                     await broadcast_chart(app, caption=caption, png_buf=png)
@@ -726,9 +895,18 @@ async def lifespan(app: FastAPI):
 api = FastAPI(lifespan=lifespan)
 
 # Routes
-@api.get("/")
+@api.api_route("/", methods=["GET", "HEAD"])
 def health():
+    # For HEAD, FastAPI drops body but returns 200 OK
     return {"ok": True}
+
+@api.get("/robots.txt")
+def robots():
+    return Response("User-agent: *\nDisallow:\n", media_type="text/plain")
+
+@api.get("/favicon.ico")
+def favicon():
+    return Response(status_code=204)
 
 @api.get("/pairs")
 def list_pairs():
@@ -768,6 +946,7 @@ application.add_handler(CommandHandler("signalsoff", cmd_signalsoff))
 application.add_handler(CommandHandler("grantme", cmd_grantme))
 application.add_handler(CommandHandler("chart", cmd_chart))
 application.add_handler(CommandHandler("live", cmd_live))
+application.add_handler(CommandHandler("predict", cmd_predict))
 application.add_handler(CommandHandler("pairs", cmd_pairs))
 application.add_handler(PreCheckoutQueryHandler(precheckout))
 application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
