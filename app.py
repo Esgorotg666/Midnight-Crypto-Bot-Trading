@@ -391,10 +391,11 @@ class Engine:
         score=(0.70*mom_z + 0.60*hist_z + 0.50*rsi_d + 0.40*slope_z + 0.35*regime - 0.25*(vol_clamped-0.10))
         prob_up=_sigmoid(score)
         label = "BUY" if prob_up>=0.60 else ("SELL" if prob_up<=0.40 else "HOLD")
-        explanation=(f"mom_z={m om_z:.2f}; macd_z={hist_z:.2f}; rsiΔ={rsi_d:.2f}; slope_z={slope_z:.2f}; "
-                     f"regime={'bull' if regime>0 else 'bear'}; vol={vol_k:.3f}; horizon={horizon} bars")
-        return (label, float(prob_up), explanation, df)
-
+        explanation = (
+    f"mom_z={mom_z:.2f}; macd_z={hist_z:.2f}; rsiΔ={rsi_d:.2f}; "
+    f"slope_z={slope_z:.2f}; regime={'bull' if regime>0 else 'bear'}; "
+    f"vol={vol_k:.3f}; horizon={horizon} bars"
+)
 # ─────────────── Plotting ───────────────
 def plot_signal_chart(pair, df, mark, price, title_tf=None, last_tick=None):
     dfp = df.tail(200).copy()
