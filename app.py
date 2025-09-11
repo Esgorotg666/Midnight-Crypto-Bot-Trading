@@ -214,7 +214,24 @@ def _tf_seconds(tf: str) -> int:
 def _is_stale(last_dt_local: pd.Timestamp, tf: str) -> bool:
     now_local = pd.Timestamp.now(tz=LOCAL_TZ)
     return (now_local - last_dt_local).total_seconds() > (2 * _tf_seconds(tf))
+import matplotlib.dates as mdates  # you already import this
 
+def _choose_time_axis(ax, tf: str):
+    sec = _tf_seconds(tf or "1m")
+    # Intraday (<= 1h bars): show HH:MM on top line, month-day under it
+    if sec <= 3600:
+        locator   = mdates.AutoDateLocator(minticks=5, maxticks=8)
+        formatter = mdates.DateFormatter("%H:%M\n%b-%d", tz=LOCAL_TZ)
+    # Multi-hour but < 1 day (e.g., 2h/4h/6h/12h): show date + hour
+    elif sec < 86400:
+        locator   = mdates.AutoDateLocator(minticks=4, maxticks=7)
+        formatter = mdates.DateFormatter("%b-%d\n%H:%M", tz=LOCAL_TZ)
+    # Daily/Weekly/Monthly: show only calendar dates (no time-of-day)
+    else:
+        locator   = mdates.AutoDateLocator(minticks=5, maxticks=8)
+        formatter = mdates.DateFormatter("%b %d\n%Y", tz=LOCAL_TZ)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(formatter)
 # Human aliases → CCXT TF
 def _normalize_tf(tf: str | None) -> str:
     if not tf: return TIMEFRAME
