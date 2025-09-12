@@ -82,6 +82,22 @@ CREATE TABLE IF NOT EXISTS ecosystems (
   symbols TEXT NOT NULL
 )""")
 
+# Global settings (e.g., current strategy)
+cur.execute("""
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+)""")
+
+# Strategy parameters (key/value per strategy)
+cur.execute("""
+CREATE TABLE IF NOT EXISTS strategy_params (
+  strategy TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  PRIMARY KEY (strategy, key)
+)""")
+
 conn.commit()
 
 def now_ts() -> int: return int(time.time())
@@ -137,9 +153,36 @@ def eco_get(name: str):
     if not row: return []
     return [s for s in row[0].split(",") if s]
 
-# Seed Pairs (from env) if empty
+def set_setting(k: str, v: str):
+    cur.execute("""INSERT INTO settings(key,value) VALUES(?,?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (k, v)); conn.commit()
+
+def get_setting(k: str, default: str=None) -> str:
+    row = cur.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+    return row[0] if row else default
+
+def set_param(strategy: str, key: str, value: str):
+    cur.execute("""INSERT INTO strategy_params(strategy,key,value) VALUES(?,?,?)
+                   ON CONFLICT(strategy,key) DO UPDATE SET value=excluded.value""",
+                (strategy, key, value)); conn.commit()
+
+def get_param(strategy: str, key: str, default: str=None) -> str:
+    row = cur.execute("SELECT value FROM strategy_params WHERE strategy=? AND key=?", (strategy, key)).fetchone()
+    return row[0] if row else default
+
+# Seed default strategy if not set
+if not get_setting("strategy"):
+    set_setting("strategy", "ma")
+
+# ─────────────── Default Pairs (seed once if DB empty) ───────────────
+SEED_PAIRS = [
+    "BTC/USDT","ETH/USDT","SOL/USDT","XRP/USDT","ADA/USDT","DOGE/USDT","SHIB/USDT","AVAX/USDT",
+    "DOT/USDT","LINK/USDT","TRX/USDT","LTC/USDT","PEPE/USDT","ORDI/USDT","TON/USDT","APT/USDT",
+    "ARB/USDT","SUI/USDT","ENA/USDT","TAIKO/USDT","HYPE/USDT","DEGEN/USDT","SEI/USDT","JUP/USDT",
+    "NEAR/USDT","FLOKI/USDT","BONK/USDT"
+]
 if not db_get_pairs():
-    for p in PAIRS: db_add_pair(p)
+    for p in SEED_PAIRS: db_add_pair(p)
 
 # Optional seed ecosystems (only if empty)
 if not eco_list():
@@ -258,6 +301,7 @@ def _macd(close: pd.Series):
     return macd, signal, hist
 
 def _atr(df: pd.DataFrame, period: int=14) -> pd.Series:
+    if df.empty: return pd.Series(dtype=float)
     h,l,c = df["high"], df["low"], df["close"]; pc=c.shift(1)
     tr = pd.concat([(h-l), (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
@@ -300,7 +344,124 @@ def _choose_time_axis(ax, tf: str):
     ax.xaxis.set_major_locator(locator)
     ax.xaxis.set_major_formatter(formatter)
 
-# ─────────────── Strategy Engine ───────────────
+# Resample higher timeframe from fresher lower TF OHLCV
+def _resample_ohlcv(base_df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    if base_df.empty:
+        return base_df
+    d = base_df.copy().sort_values("time").set_index("time")
+    for col in ["open","high","low","close","volume"]:
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+    agg = d.resample(rule, label="right", closed="right").agg({
+        "open":"first","high":"max","low":"min","close":"last","volume":"sum",
+    }).dropna(subset=["open","high","low","close"])
+    agg = agg.reset_index()
+    agg["ts"] = (agg["time"].view("int64") // 1_000_000).astype("int64")
+    return agg[["ts","open","high","low","close","volume","time"]]
+
+def _fmt_money(x: float) -> str:
+    if abs(x) >= 1000:
+        return f"${x:,.0f}"
+    return f"${x:,.2f}"
+
+def _fmt_pct(x: float) -> str:
+    return f"{x*100:.2f}%"
+
+def _recommend_sl_tp(df: pd.DataFrame, entry: float, side: str, atr_mult_sl: float = 1.5, r_targets: tuple = (2.0, 3.0)):
+    atrs = _atr(df, 14)
+    if atrs.empty or pd.isna(atrs.iloc[-1]): atr = 0.0
+    else: atr = float(atrs.iloc[-1])
+    if side == "short":
+        sl  = entry + atr_mult_sl * atr
+        R   = abs(sl - entry)
+        tp1 = entry - r_targets[0] * R
+        tp2 = entry - r_targets[1] * R
+    else:
+        sl  = entry - atr_mult_sl * atr
+        R   = abs(entry - sl)
+        tp1 = entry + r_targets[0] * R
+        tp2 = entry + r_targets[1] * R
+    return sl, tp1, tp2, atr, R
+
+# ─────────────── Strategy defaults ───────────────
+STRATEGIES = ("ma", "rsi", "scalp", "event", "dca")
+
+if get_param("ma","fast") is None:
+    # MA crossover
+    set_param("ma","fast","50")
+    set_param("ma","slow","200")
+    # RSI
+    set_param("rsi","period","14")
+    set_param("rsi","buy_level","45")
+    set_param("rsi","sell_level","65")
+    # Scalping
+    set_param("scalp","lookback","20")
+    set_param("scalp","atr_mult","0.6")
+    set_param("scalp","min_vol_mult","1.5")
+    # Event-driven
+    set_param("event","vol_mult","2.0")
+    set_param("event","atr_mult","1.2")
+    # DCA previews
+    set_param("dca","every_min","1440")   # daily
+    set_param("dca","size_quote","50")    # $50
+
+# ─────────────── Strategy signal functions ───────────────
+def strategy_ma(df: pd.DataFrame) -> tuple[str|None, str|None]:
+    fast = int(get_param("ma","fast","50"))
+    slow = int(get_param("ma","slow","200"))
+    if len(df) < slow+2: return None, None
+    df["s_fast"] = df["close"].rolling(fast).mean()
+    df["s_slow"] = df["close"].rolling(slow).mean()
+    r, p = df.iloc[-1], df.iloc[-2]
+    if p.s_fast <= p.s_slow and r.s_fast > r.s_slow:
+        return "LONG", f"SMA crossover fast({fast})>slow({slow})"
+    if p.s_fast >= p.s_slow and r.s_fast < r.s_slow:
+        return "EXIT", f"SMA crossover fast({fast})<slow({slow})"
+    return None, None
+
+def strategy_rsi(df: pd.DataFrame) -> tuple[str|None, str|None]:
+    period = int(get_param("rsi","period","14"))
+    buy_lv = float(get_param("rsi","buy_level","45"))
+    sell_lv = float(get_param("rsi","sell_level","65"))
+    if len(df) < period+2: return None, None
+    rsi = Engine.rsi(df["close"], period)
+    df["rsi"] = rsi
+    r, p = df.iloc[-1], df.iloc[-2]
+    if p.rsi < buy_lv <= r.rsi: return "LONG", f"RSI up-cross {buy_lv}"
+    if p.rsi > sell_lv >= r.rsi: return "EXIT", f"RSI down-cross {sell_lv}"
+    return None, None
+
+def strategy_scalp(df: pd.DataFrame) -> tuple[str|None, str|None]:
+    lb = int(get_param("scalp","lookback","20"))
+    atr_mult = float(get_param("scalp","atr_mult","0.6"))
+    vol_mult = float(get_param("scalp","min_vol_mult","1.5"))
+    if len(df) < max(lb, 20)+5: return None, None
+    df["atr"]=_atr(df,14).fillna(0.0)
+    df["vol_ma"]=df["volume"].rolling(20).mean()
+    hi = df["high"].rolling(lb).max()
+    lo = df["low"].rolling(lb).min()
+    r = df.iloc[-1]
+    if r["close"] > hi.iloc[-2] + atr_mult*r["atr"] and r["volume"] > vol_mult*(df["vol_ma"].iloc[-1]+1e-9):
+        return "LONG", f"Breakout>{lb}-bar high with ATR buffer & vol surge"
+    if r["close"] < lo.iloc[-2] - atr_mult*r["atr"] and r["volume"] > vol_mult*(df["vol_ma"].iloc[-1]+1e-9):
+        return "EXIT", f"Breakdown<{lb}-bar low with ATR buffer & vol surge"
+    return None, None
+
+def strategy_event(df: pd.DataFrame) -> tuple[str|None, str|None]:
+    vol_mult = float(get_param("event","vol_mult","2.0"))
+    atr_mult = float(get_param("event","atr_mult","1.2"))
+    if len(df) < 40: return None, None
+    atr = _atr(df,14)
+    atr_ma = atr.rolling(20).mean()
+    vol_ma = df["volume"].rolling(20).mean()
+    r = df.iloc[-1]
+    spike_vol = r["volume"] > vol_mult*(vol_ma.iloc[-1]+1e-9)
+    spike_atr = (atr.iloc[-1] > atr_mult*(atr_ma.iloc[-1]+1e-9))
+    if spike_vol and spike_atr:
+        if r["close"] > r["open"]: return "LONG", "Event spike: volume & volatility up (bullish candle)"
+        else: return "EXIT", "Event spike: volume & volatility up (bearish candle)"
+    return None, None
+
+# ─────────────── Engine ───────────────
 class Engine:
     def __init__(self, exchange_id, timeframe, requested_pairs):
         self.ex = getattr(ccxt, exchange_id)({"enableRateLimit": True})
@@ -324,17 +485,48 @@ class Engine:
 
     async def fetch_df(self, pair, limit=400, timeframe: str | None = None):
         tf = timeframe or self.tf
+
         def get_ohlcv(): return self.ex.fetch_ohlcv(pair, timeframe=tf, limit=limit)
         try: ohlcv = await asyncio.to_thread(get_ohlcv)
         except Exception as e:
             logging.warning("fetch_ohlcv failed for %s: %s", pair, e)
             return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
-        if not ohlcv or len(ohlcv) < 210:
-            logging.info("[%s] Not enough candles: %s", pair, len(ohlcv) if ohlcv else 0)
+
+        if not ohlcv or len(ohlcv) < 50:
+            logging.info("[%s] Not enough candles on %s: %s", pair, tf, len(ohlcv) if ohlcv else 0)
             return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
+
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
         df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert(LOCAL_TZ)
         df.sort_values("time", inplace=True)
+
+        # Fallback: synthesize higher TF from fresher base if stale
+        if tf in ("1d", "1w", "1M") and not df.empty:
+            last_dt = df["time"].iloc[-1]
+            if _is_stale(last_dt, tf):
+                try:
+                    if tf == "1d":
+                        base_tf, rule = "1h", "1D"
+                    elif tf == "1w":
+                        base_tf, rule = "1d", "1W-SUN"   # change to '1W-MON' if you prefer Monday week
+                    else:  # "1M"
+                        base_tf, rule = "1d", "1MS"      # month start
+
+                    def get_base():
+                        return self.ex.fetch_ohlcv(pair, timeframe=base_tf, limit=1500 if base_tf=="1h" else 500)
+
+                    base = await asyncio.to_thread(get_base)
+                    if base and len(base) > 50:
+                        bdf = pd.DataFrame(base, columns=["ts","open","high","low","close","volume"])
+                        bdf["time"] = pd.to_datetime(bdf["ts"], unit="ms", utc=True).dt.tz_convert(LOCAL_TZ)
+                        bdf.sort_values("time", inplace=True)
+                        agg = _resample_ohlcv(bdf, rule)
+                        if not agg.empty:
+                            df = agg.tail(limit).copy()
+                            logging.info("Resampled %s from %s -> %s (%d rows)", pair, base_tf, tf, len(df))
+                except Exception as e:
+                    logging.warning("Resample fallback failed for %s %s: %s", pair, tf, e)
+
         return df
 
     @staticmethod
@@ -345,24 +537,27 @@ class Engine:
 
     async def analyze(self, pair):
         df = await self.fetch_df(pair)
-        if df.empty or len(df)<200: return None, df
-        df["sma50"]=df["close"].rolling(50).mean()
-        df["sma200"]=df["close"].rolling(200).mean()
-        df["rsi"]=self.rsi(df["close"],14)
-        row, prev = df.iloc[-1], df.iloc[-2]
-        long_cond=(df["sma50"].iloc[-1]>df["sma200"].iloc[-1]) and (prev.rsi<45<=row.rsi)
-        exit_cond=(row.rsi>65) or (df["sma50"].iloc[-1]<df["sma200"].iloc[-1])
-        price=row["close"]; ts=row["time"].strftime("%Y-%m-%d %H:%M %Z")
-        last_state=self.last.get(pair)
-        if long_cond and last_state!="LONG":
-            self.last[pair]="LONG"
-            text=f"LONG {pair} @ {price:.2f} [{self.tf}]  ({ts})\nSMA50>SMA200; RSI up-cross from <45."
-            return ("LONG", text, price, ts), df
-        if exit_cond and last_state!="EXIT":
-            self.last[pair]="EXIT"
-            text=f"EXIT/NEUTRAL {pair} @ {price:.2f} [{self.tf}]  ({ts})\nRSI>65 or SMA50<SMA200."
-            return ("EXIT", text, price, ts), df
-        return None, df
+        if df.empty or len(df) < 200:
+            return None, df
+        strat = (get_setting("strategy","ma") or "ma").lower()
+        sig = None; reason = None
+        if strat == "ma":
+            sig, reason = strategy_ma(df)
+        elif strat == "rsi":
+            sig, reason = strategy_rsi(df)
+        elif strat == "scalp":
+            sig, reason = strategy_scalp(df)
+        elif strat == "event":
+            sig, reason = strategy_event(df)
+        else:
+            sig, reason = strategy_ma(df); strat = "ma"
+        if not sig:
+            return None, df
+        row = df.iloc[-1]
+        price = float(row["close"])
+        ts = row["time"].strftime("%Y-%m-%d %H:%M %Z")
+        text = f"{sig} {pair} @ {price:.4g} [{self.tf}]  ({ts})\nStrategy: {strat.upper()} — {reason}"
+        return (sig, text, price, ts), df
 
     async def predict(self, pair: str, horizon: int=5, timeframe: str | None=None):
         tf = timeframe or self.tf
@@ -392,10 +587,12 @@ class Engine:
         prob_up=_sigmoid(score)
         label = "BUY" if prob_up>=0.60 else ("SELL" if prob_up<=0.40 else "HOLD")
         explanation = (
-    f"mom_z={mom_z:.2f}; macd_z={hist_z:.2f}; rsiΔ={rsi_d:.2f}; "
-    f"slope_z={slope_z:.2f}; regime={'bull' if regime>0 else 'bear'}; "
-    f"vol={vol_k:.3f}; horizon={horizon} bars"
-)
+            f"mom_z={mom_z:.2f}; macd_z={hist_z:.2f}; rsiΔ={rsi_d:.2f}; "
+            f"slope_z={slope_z:.2f}; regime={'bull' if regime>0 else 'bear'}; "
+            f"vol={vol_k:.3f}; horizon={horizon} bars"
+        )
+        return (label, float(prob_up), explanation, df)
+
 # ─────────────── Plotting ───────────────
 def plot_signal_chart(pair, df, mark, price, title_tf=None, last_tick=None):
     dfp = df.tail(200).copy()
@@ -438,7 +635,6 @@ def plot_signal_chart(pair, df, mark, price, title_tf=None, last_tick=None):
     return buf
 
 def plot_compare_chart(pairs: list[str], dfs: list[pd.DataFrame], title_tf: str):
-    # Rebase each series to 100 at start
     fig, ax = plt.subplots(figsize=(8,4.5), dpi=140)
     has_any = False
     for pair, df in zip(pairs, dfs):
@@ -461,7 +657,6 @@ def plot_compare_chart(pairs: list[str], dfs: list[pd.DataFrame], title_tf: str)
     return buf
 
 def plot_ecosystem_index(name: str, dfs: list[pd.DataFrame], title_tf: str):
-    # Equal-weight index: average of each member rebased to 100
     aligned = []
     for df in dfs:
         if df.empty: continue
@@ -470,7 +665,6 @@ def plot_ecosystem_index(name: str, dfs: list[pd.DataFrame], title_tf: str):
         rb = d / d.iloc[0] * 100.0
         aligned.append(rb)
     if not aligned: return None
-    # Align on union (outer join), forward-fill short gaps
     base = pd.concat(aligned, axis=1).ffill().dropna(how="all")
     index_series = base.mean(axis=1)
 
@@ -498,7 +692,7 @@ async def broadcast_chart(app: "Application", caption: str, png_buf: io.BytesIO)
         except Exception as e:
             logging.warning(f"send photo fail {uid}: {e}")
 
-def _format_pairs_list(pairs: list[str], max_show: int = 40) -> str:
+def _format_pairs_list(pairs: list[str], max_show: int = 60) -> str:
     if not pairs: return "(none)"
     shown=pairs[:max_show]; more=len(pairs)-len(shown)
     lines,line=[],[]
@@ -520,14 +714,21 @@ async def set_bot_commands(app: "Application"):
         BotCommand("chart_daily","Daily chart w/ prediction"),
         BotCommand("chart_weekly","Weekly chart w/ prediction"),
         BotCommand("chart_monthly","Monthly chart w/ prediction"),
-        BotCommand("predict","Predict [PAIR] [TF] [H]"),
         BotCommand("live","Live chart [PAIR] [TF]"),
+        BotCommand("predict","Predict [PAIR] [TF] [H]"),
         BotCommand("compare","Compare up to 3 pairs [TF]"),
         BotCommand("hot","Top movers [TF] [N]"),
         BotCommand("eco_list","List ecosystems"),
         BotCommand("eco_chart","Chart an ecosystem [NAME] [TF]"),
         BotCommand("eco_add","Owner: add/update ecosystem"),
         BotCommand("eco_remove","Owner: remove ecosystem"),
+        BotCommand("calc","Profit & risk calculator"),
+        BotCommand("dca_plan","Preview a DCA schedule"),
+        BotCommand("strategy_list","Show available strategies"),
+        BotCommand("strategy_get","Show current strategy & params"),
+        BotCommand("strategy_set","Set strategy (ma/rsi/scalp/event/dca)"),
+        BotCommand("strategy_params","Show params for a strategy"),
+        BotCommand("strategy_setparam","Set a strategy parameter"),
         BotCommand("pairs","Requested vs active pairs"),
         BotCommand("addpair","Owner: add a pair"),
         BotCommand("removepair","Owner: remove a pair"),
@@ -535,10 +736,6 @@ async def set_bot_commands(app: "Application"):
     ]
     try: await app.bot.set_my_commands(cmds)
     except Exception as e: logging.warning(f"set_my_commands failed: {e}")
-
-def tz_label_from_ts(ts: pd.Timestamp) -> str:
-    try: return ts.tzname() or DISPLAY_TZ
-    except: return DISPLAY_TZ
 
 # ─────────────── Commands ───────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -561,11 +758,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/compare PAIR1 [PAIR2] [PAIR3] [TF] — overlay rebased\n"
         "/hot [TF] [N] — rank top movers by momentum + volume\n"
         "/eco_list — show ecosystems; /eco_chart NAME [TF]\n"
-        "/eco_add NAME PAIR1,PAIR2,... — owner only\n"
-        "/eco_remove NAME — owner only\n"
+        "/eco_add NAME PAIR1,PAIR2,...  • /eco_remove NAME (owner)\n"
+        "/calc — profit & risk calculator\n"
+        "/dca_plan [PAIR] [TF] [SIZE] [EVERY_MIN] — preview DCA\n"
+        "/strategy_list • /strategy_get • /strategy_set NAME\n"
+        "/strategy_params NAME • /strategy_setparam NAME KEY VALUE\n"
         "/pairs — requested vs active on the exchange\n"
-        "/addpair SYMBOL/QUOTE — owner\n"
-        "/removepair SYMBOL/QUOTE — owner\n"
+        "/addpair SYMBOL/QUOTE • /removepair SYMBOL/QUOTE (owner)\n"
         "\nTF: 1m/5m/15m/1h/1d/1w/1M or words: daily/weekly/monthly\n"
         f"\n📈 Available pairs (active):\n{active_block}"
         f"\n\n🌐 Ecosystems: {eco_names}"
@@ -667,22 +866,22 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         df=await engine.fetch_df(pair, timeframe=tf)
         if df.empty: return await update.message.reply_text(f"No data for {pair} on {tf}. Try later.")
-        df["sma50"]=df["close"].rolling(50).mean()
-        df["sma200"]=df["close"].rolling(200).mean()
-        df["rsi"]=engine.rsi(df["close"],14)
+        # Marker based on current strategy
+        sig, reason = None, None
+        sname = (get_setting("strategy","ma") or "ma").lower()
+        if sname == "ma":   sig, reason = strategy_ma(df)
+        elif sname == "rsi": sig, reason = strategy_rsi(df)
+        elif sname == "scalp": sig, reason = strategy_scalp(df)
+        elif sname == "event": sig, reason = strategy_event(df)
         mark=price=None
-        if len(df)>=2:
-            row,prev=df.iloc[-1],df.iloc[-2]
-            long_cond=(df["sma50"].iloc[-1]>df["sma200"].iloc[-1]) and (prev.rsi<45<=row.rsi)
-            exit_cond=(row.rsi>65) or (df["sma50"].iloc[-1]<df["sma200"].iloc[-1])
-            if long_cond: mark,price="LONG",float(row["close"])
-            elif exit_cond: mark,price="EXIT",float(row["close"])
+        if sig:
+            price=float(df["close"].iloc[-1])
+            mark="LONG" if sig=="LONG" else "EXIT"
         cons,used,spread,_=await price_agg.get_consensus(pair)
         last_dt=df["time"].iloc[-1]; stale=_is_stale(last_dt, tf)
         png=plot_signal_chart(pair, df, mark, price, title_tf=tf, last_tick=cons)
         caption=f"{pair} — {tf}\nAs of: {last_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}"
-        if mark=="LONG": caption+="\nBUY signal"
-        elif mark=="EXIT": caption+="\nSELL/EXIT signal"
+        if mark: caption+=f"\nStrategy {sname.upper()}: {reason}"
         if cons is not None:
             caption+=f"\nConsensus: {cons:.2f} from {used} exchanges"
             if spread is not None: caption+=f" (spread {spread:.2f})"
@@ -716,22 +915,21 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             df=await engine.fetch_df(pair, timeframe=tf)
             if df.empty: await status_msg.edit_text(f"No data for {pair} on {tf}."); break
-            df["sma50"]=df["close"].rolling(50).mean()
-            df["sma200"]=df["close"].rolling(200).mean()
-            df["rsi"]=engine.rsi(df["close"],14)
+            sig, reason = None, None
+            sname = (get_setting("strategy","ma") or "ma").lower()
+            if sname == "ma": sig, reason = strategy_ma(df)
+            elif sname == "rsi": sig, reason = strategy_rsi(df)
+            elif sname == "scalp": sig, reason = strategy_scalp(df)
+            elif sname == "event": sig, reason = strategy_event(df)
             mark=price=None
-            if len(df)>=2:
-                row,prev=df.iloc[-1],df.iloc[-2]
-                long_cond=(df["sma50"].iloc[-1]>df["sma200"].iloc[-1]) and (prev.rsi<45<=row.rsi)
-                exit_cond=(row.rsi>65) or (df["sma50"].iloc[-1]<df["sma200"].iloc[-1])
-                if long_cond: mark,price="LONG",float(row["close"])
-                elif exit_cond: mark,price="EXIT",float(row["close"])
+            if sig:
+                price=float(df["close"].iloc[-1])
+                mark="LONG" if sig=="LONG" else "EXIT"
             cons,used,spread,_=await price_agg.get_consensus(pair)
             png=plot_signal_chart(pair, df, mark, price, title_tf=tf, last_tick=cons)
             last_dt=df["time"].iloc[-1]; stale=_is_stale(last_dt, tf)
             caption=f"{pair} — {tf}\nAs of: {last_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}"
-            if mark=="LONG": caption+="\nBUY"
-            elif mark=="EXIT": caption+="\nSELL/EXIT"
+            if mark: caption+=f"\nStrategy {sname.upper()}: {reason}"
             if cons is not None:
                 caption+=f"\nConsensus: {cons:.2f} from {used} exchanges"
                 if spread is not None: caption+=f" (spread {spread:.2f})"
@@ -761,7 +959,7 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: await update.message.reply_text(f"Live session ended for {pair} ({tf}).")
     except: pass
 
-# PREDICT
+# PREDICT (model-based)
 async def cmd_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_active(update.effective_user.id): return await update.message.reply_text("Inactive. Use /subscribe.")
     args=[a.strip() for a in ctx.args] if ctx.args else []
@@ -820,7 +1018,6 @@ async def cmd_hot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_active(update.effective_user.id): return await update.message.reply_text("Inactive. Use /subscribe.")
     args=[a.strip().lower() for a in ctx.args] if ctx.args else []
     tf = None; topn = 10
-    # parse TF and N
     if args:
         maybe=args[-1]
         if maybe.isdigit(): topn=int(maybe); args=args[:-1]
@@ -829,7 +1026,6 @@ async def cmd_hot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tf = tf or "1h"
     pairs = engine.valid_pairs or await _pick_default_pair()
     if isinstance(pairs, str): pairs=[pairs]
-
     rows=[]
     for p in pairs:
         try:
@@ -837,21 +1033,17 @@ async def cmd_hot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if df.empty or len(df)<50: continue
             df["ret1"]=df["close"].pct_change()
             df["vol_ma"]=df["volume"].rolling(20).mean()
-            # momentum over last 10 bars (or min length)
             look=min(10, max(5, len(df)//10))
             mom = (df["close"].iloc[-1] / df["close"].iloc[-look] - 1.0)
             vol_surge = (df["volume"].iloc[-1] / (df["vol_ma"].iloc[-1] + 1e-9))
-            score = 0.7*mom + 0.3*min(vol_surge/5.0, 1.0)  # cap vol effect
+            score = 0.7*mom + 0.3*min(vol_surge/5.0, 1.0)
             rows.append((p, mom, vol_surge, score))
         except Exception:
             continue
     if not rows:
         return await update.message.reply_text("No data to rank right now.")
-
     rows.sort(key=lambda r: r[3], reverse=True)
     rows = rows[:topn]
-
-    # Pretty table
     lines = ["🔥 Hot movers (TF: %s)" % tf, "PAIR       MOM%    VOLx    SCORE"]
     for (p, mom, volx, sc) in rows:
         lines.append(f"{p:<10} {mom*100:>6.2f}%   {volx:>4.2f}x   {sc:>5.3f}")
@@ -898,9 +1090,7 @@ async def cmd_eco_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     members = eco_get(name)
     if not members:
         return await update.message.reply_text(f"No ecosystem named {name}. Use /eco_list.")
-    # fetch dfs
-    dfs=[]
-    kept=[]
+    dfs=[]; kept=[]
     for p in members:
         df=await engine.fetch_df(p, timeframe=tf)
         if df.empty: continue
@@ -914,6 +1104,179 @@ async def cmd_eco_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
              f"As of: {asof.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     await update.message.reply_photo(png, caption=caption)
 
+# CALCULATOR
+async def cmd_calc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage:
+      /calc PAIR [TF] [side] [entry] [exit] [size]
+      - side: long | short   (default: long)
+      - TF:   1m/5m/15m/1h/1d/1w/1M or daily/weekly/monthly (default: TIMEFRAME)
+      - entry, exit, size are floats (size in quote currency, e.g., USDT)
+    Example:
+      /calc BTC/USDT 1h long 100000 105000 250
+      /calc ETH/USDT daily long 3500 0 500   (0 exit → recommend SL/TP by ATR)
+    """
+    if not is_active(update.effective_user.id):
+        return await update.message.reply_text("Inactive. Use /subscribe.")
+    args = [a.strip() for a in ctx.args] if ctx.args else []
+    if not args:
+        return await update.message.reply_text(
+            "Usage: /calc PAIR [TF] [side] [entry] [exit] [size]\n"
+            "Example: /calc BTC/USDT 1h long 100000 105000 250"
+        )
+    pair = args[0].upper(); idx = 1
+    tf = TIMEFRAME
+    if idx < len(args):
+        maybe_tf = args[idx].lower()
+        if any(maybe_tf.endswith(suf) for suf in ("m","h","d","w","M")) or maybe_tf in ("daily","weekly","monthly","day","week","month"):
+            tf = _normalize_tf(maybe_tf); idx += 1
+    side = "long"
+    if idx < len(args):
+        if args[idx].lower() in ("long","short"):
+            side = args[idx].lower(); idx += 1
+    try:
+        entry = float(args[idx]); idx += 1
+    except Exception:
+        return await update.message.reply_text("Could not parse entry price.")
+    exit_price = None
+    if idx < len(args):
+        try:
+            val = float(args[idx]); idx += 1
+            if val > 0: exit_price = val
+        except Exception:
+            pass
+    size = 100.0
+    if idx < len(args):
+        try: size = float(args[idx])
+        except Exception: pass
+
+    try:
+        df = await engine.fetch_df(pair, timeframe=tf)
+        if df.empty:
+            return await update.message.reply_text(f"No data for {pair} on {tf}.")
+    except Exception as e:
+        logging.warning("calc fetch_df error: %s", e)
+        return await update.message.reply_text("Data fetch error. Try again shortly.")
+
+    sl, tp1, tp2, atr, R = _recommend_sl_tp(df, entry, side)
+    qty = size / entry
+    use_exit = exit_price if exit_price and exit_price > 0 else tp1
+    if side == "short":
+        pnl_per_unit = (entry - use_exit)
+        ret = (entry - use_exit) / entry
+    else:
+        pnl_per_unit = (use_exit - entry)
+        ret = (use_exit - entry) / entry
+    pnl = pnl_per_unit * qty
+    risk_total = R * qty
+    r_multiple = (pnl_per_unit / R) if R > 0 else float("nan")
+
+    lines = [
+        f"🧮 Calculator — {pair} ({tf})",
+        f"Side: {side.upper()}",
+        f"Entry: {entry:.6g}",
+        f"Size: {_fmt_money(size)} (≈ {qty:.6f} units)",
+        "",
+    ]
+    if exit_price:
+        lines += [
+            f"Exit:  {exit_price:.6g}",
+            f"PnL:   {_fmt_money(pnl)}  ({_fmt_pct(ret)})",
+            f"Risk@SL: {_fmt_money(-risk_total)}  (if SL hit)",
+        ]
+    else:
+        lines += [
+            f"Suggested SL: {sl:.6g}   (ATR14 ≈ {atr:.6g}, 1.5×ATR)",
+            f"TP1 (2R):     {tp1:.6g}",
+            f"TP2 (3R):     {tp2:.6g}",
+            "",
+            f"PnL@TP1: {_fmt_money(pnl)}  ({_fmt_pct(ret)})   •  R multiple ≈ {r_multiple:.2f}",
+            f"Risk@SL: {_fmt_money(-risk_total)}",
+        ]
+    lines += [
+        "",
+        "Notes:",
+        "• Size is in quote (e.g., USDT). Qty = size / entry.",
+        "• SL/TP based on ATR(14). Adjust multipliers to taste.",
+        "• Educational only. Not financial advice.",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+# DCA planner (preview only)
+async def cmd_dca_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_active(update.effective_user.id):
+        return await update.message.reply_text("Inactive. Use /subscribe.")
+    args=[a.strip() for a in ctx.args] if ctx.args else []
+    pair = args[0].upper() if args else await _pick_default_pair()
+    tf = _normalize_tf(args[1]) if len(args) > 1 else TIMEFRAME
+    size = float(args[2]) if len(args) > 2 else float(get_param("dca","size_quote","50"))
+    every_min = int(args[3]) if len(args) > 3 else int(get_param("dca","every_min","1440"))
+
+    df = await engine.fetch_df(pair, timeframe=tf)
+    if df.empty or len(df) < 20:
+        return await update.message.reply_text(f"No data for {pair} on {tf}.")
+    closes = df["close"].tail(10).tolist()
+    steps = len(closes)
+    qtys = [size/c for c in closes]
+    avg_price = sum(size for _ in closes)/sum(qtys)
+    atrs = _atr(df,14); atr = 0.0 if atrs.empty or pd.isna(atrs.iloc[-1]) else float(atrs.iloc[-1])
+
+    lines = [
+        f"📅 DCA plan — {pair} ({tf})",
+        f"Every {every_min} min • {steps} steps • Size per step: {_fmt_money(size)}",
+        f"ATR(14) ≈ {atr:.6g} (risk guide only)",
+        "",
+        "Step   Price        Qty",
+    ]
+    for i, (c, q) in enumerate(zip(closes, qtys), 1):
+        lines.append(f"{i:>2}     {c:>10.6g}   {q:>10.6f}")
+    lines += [
+        "",
+        f"Avg entry (simulated): {avg_price:.6g}",
+        "Tip: Consider SL below multi-day swing or k×ATR; scale exits at 2R/3R.",
+        "Educational only. Not financial advice.",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+# STRATEGY control commands
+async def cmd_strategy_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    current = (get_setting("strategy","ma") or "ma").lower()
+    names = ", ".join(n.upper() for n in STRATEGIES)
+    await update.message.reply_text(f"Available: {names}\nCurrent: {current.upper()}")
+
+async def cmd_strategy_get(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    s = (get_setting("strategy","ma") or "ma").lower()
+    params = cur.execute("SELECT key,value FROM strategy_params WHERE strategy=? ORDER BY key", (s,)).fetchall()
+    lines = [f"Strategy: {s.upper()}"]
+    for k,v in params: lines.append(f"• {k} = {v}")
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_strategy_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args: return await update.message.reply_text("Usage: /strategy_set NAME  (ma|rsi|scalp|event|dca)")
+    name = ctx.args[0].lower()
+    if name not in STRATEGIES: return await update.message.reply_text(f"Unknown strategy. Use: {', '.join(STRATEGIES)}")
+    set_setting("strategy", name)
+    await update.message.reply_text(f"Strategy set to {name.upper()}.")
+
+async def cmd_strategy_params(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /strategy_params NAME")
+    name = ctx.args[0].lower()
+    if name not in STRATEGIES: return await update.message.reply_text("Unknown strategy.")
+    params = cur.execute("SELECT key,value FROM strategy_params WHERE strategy=? ORDER BY key", (name,)).fetchall()
+    if not params: return await update.message.reply_text("No params saved.")
+    lines = [f"{name.upper()} params:"]
+    for k,v in params: lines.append(f"• {k} = {v}")
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_strategy_setparam(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) < 3:
+        return await update.message.reply_text("Usage: /strategy_setparam NAME KEY VALUE")
+    name = ctx.args[0].lower(); key = ctx.args[1]; value = " ".join(ctx.args[2:])
+    if name not in STRATEGIES: return await update.message.reply_text("Unknown strategy.")
+    set_param(name, key, value)
+    await update.message.reply_text(f"Param saved: {name}.{key} = {value}")
+
 # ─────────────── Scheduler ───────────────
 engine = Engine(EXCHANGE, TIMEFRAME, db_get_pairs())
 
@@ -925,8 +1288,6 @@ async def scheduled_job(app: "Application"):
             mark, text, price, ts = res
             await broadcast(text, app)
             try:
-                if "sma50" not in df.columns: df["sma50"]=df["close"].rolling(50).mean()
-                if "sma200" not in df.columns: df["sma200"]=df["close"].rolling(200).mean()
                 cons,used,spread,_=await price_agg.get_consensus(pair)
                 png=plot_signal_chart(pair, df, mark, price, title_tf=None, last_tick=cons)
                 last_dt=df["time"].iloc[-1]
@@ -1037,6 +1398,15 @@ application.add_handler(CommandHandler("eco_list", cmd_eco_list))
 application.add_handler(CommandHandler("eco_chart", cmd_eco_chart))
 application.add_handler(CommandHandler("eco_add", cmd_eco_add))
 application.add_handler(CommandHandler("eco_remove", cmd_eco_remove))
+
+application.add_handler(CommandHandler("calc", cmd_calc))
+application.add_handler(CommandHandler("dca_plan", cmd_dca_plan))
+
+application.add_handler(CommandHandler("strategy_list", cmd_strategy_list))
+application.add_handler(CommandHandler("strategy_get", cmd_strategy_get))
+application.add_handler(CommandHandler("strategy_set", cmd_strategy_set))
+application.add_handler(CommandHandler("strategy_params", cmd_strategy_params))
+application.add_handler(CommandHandler("strategy_setparam", cmd_strategy_setparam))
 
 application.add_handler(CommandHandler("pairs", cmd_pairs))
 application.add_handler(CommandHandler("listpairs", cmd_listpairs))
