@@ -536,30 +536,35 @@ class Engine:
         ru=pd.Series(up).rolling(period).mean(); rd=pd.Series(dn).rolling(period).mean()
         rs = ru/(rd+1e-9); return 100.0 - (100.0/(1.0+rs))
 
-    async def analyze(self, pair):
-        df = await self.fetch_df(pair)
-        if df.empty or len(df) < 200:
-            return None, df
-        strat = (get_setting("strategy","ma") or "ma").lower()
-        sig = None; reason = None
-        if strat == "ma":
-            sig, reason = strategy_ma(df)
-        elif strat == "rsi":
-            sig, reason = strategy_rsi(df)
-        elif strat == "scalp":
-            sig, reason = strategy_scalp(df)
-        elif strat == "event":
-            sig, reason = strategy_event(df)
-        else:
-            sig, reason = strategy_ma(df); strat = "ma"
-        if not sig:
-            return None, df
-        row = df.iloc[-1]
-        price = float(row["close"])
-        ts = row["time"].strftime("%Y-%m-%d %H:%M %Z")
-        text = f"{sig} {pair} @ {price:.4g} [{self.tf}]  ({ts})\nStrategy: {strat.upper()} — {reason}"
-        return (sig, text, price, ts), df
+async def analyze(self, pair):
+    df = await self.fetch_df(pair)
+    if df.empty or len(df) < 200:
+        return None, df
 
+    strat = (get_setting("strategy", "ma") or "ma").lower()
+    sig, reason = None, None
+    if strat == "ma":
+        sig, reason = strategy_ma(df)
+    elif strat == "rsi":
+        sig, reason = strategy_rsi(df)
+    elif strat == "scalp":
+        sig, reason = strategy_scalp(df)
+    elif strat == "event":
+        sig, reason = strategy_event(df)
+    else:
+        sig, reason = strategy_ma(df)
+        strat = "ma"
+
+    if not sig:
+        return None, df
+
+    row = df.iloc[-1]
+    price = float(row["close"])
+    ts = row["time"].strftime("%Y-%m-%d %H:%M %Z")
+    text = f"{sig} {pair} @ {price:.4g} [{self.tf}]  ({ts})\nStrategy: {strat.upper()} — {reason}"
+    return (sig, text, price, ts), df
+
+    
     async def predict(self, pair: str, horizon: int=5, timeframe: str | None=None):
         tf = timeframe or self.tf
         df = await self.fetch_df(pair, timeframe=tf)
