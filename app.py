@@ -9,6 +9,7 @@ import traceback
 from statistics import median
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+from strategies import strategy_ma, strategy_rsi, strategy_scalp, strategy_event
 
 # Headless plotting
 os.environ.setdefault("MPLBACKEND", "Agg")
