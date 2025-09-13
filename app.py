@@ -9,7 +9,6 @@ import traceback
 from statistics import median
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
-from strategies import strategy_ma, strategy_rsi, strategy_scalp, strategy_event
 
 # Headless plotting
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -170,6 +169,12 @@ def set_param(strategy: str, key: str, value: str):
 def get_param(strategy: str, key: str, default: str=None) -> str:
     row = cur.execute("SELECT value FROM strategy_params WHERE strategy=? AND key=?", (strategy, key)).fetchone()
     return row[0] if row else default
+
+# === load strategies after get_param exists ===
+import strategies
+from strategies import strategy_ma, strategy_rsi, strategy_scalp, strategy_event
+strategies.set_param_getter(get_param)
+
 
 # Seed default strategy if not set
 if not get_setting("strategy"):
