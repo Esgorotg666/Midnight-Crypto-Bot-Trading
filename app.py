@@ -541,6 +541,46 @@ class Engine:
         ru=pd.Series(up).rolling(period).mean(); rd=pd.Series(dn).rolling(period).mean()
         rs = ru/(rd+1e-9); return 100.0 - (100.0/(1.0+rs))
 
+    async def analyze(self, pair: str):
+        """
+        Runs the currently selected strategy on the latest dataframe for `pair`.
+        Returns:
+          ( (signal, text, price, ts_str), df )  on signal,
+          ( None, df )                             if no signal
+        """
+        df = await self.fetch_df(pair, timeframe=self.tf)
+        if df.empty or len(df) < 200:
+            return None, df
+
+        # Determine active strategy
+        strat = (get_setting("strategy", "ma") or "ma").lower()
+
+        # Import strategy funcs (already injected via strategies.set_param_getter in app.py)
+        from strategies import strategy_ma, strategy_rsi, strategy_scalp, strategy_event
+
+        sig, reason = None, None
+        if strat == "ma":
+            sig, reason = strategy_ma(df)
+        elif strat == "rsi":
+            sig, reason = strategy_rsi(df)
+        elif strat == "scalp":
+            sig, reason = strategy_scalp(df)
+        elif strat == "event":
+            sig, reason = strategy_event(df)
+        else:
+            # fallback to MA
+            sig, reason = strategy_ma(df)
+            strat = "ma"
+
+        if not sig:
+            return None, df
+
+        row = df.iloc[-1]
+        price = float(row["close"])
+        ts = row["time"].strftime("%Y-%m-%d %H:%M %Z")
+        text = f"{sig} {pair} @ {price:.4g} [{self.tf}]  ({ts})\nStrategy: {strat.upper()} — {reason}"
+        return (sig, text, price, ts), df
+
 async def analyze(self, pair):
     df = await self.fetch_df(pair)
     if df.empty or len(df) < 200:
