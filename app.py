@@ -1,5 +1,5 @@
-import os, math, io, asyncio, logging, sqlite3
-from typing import Optional, Tuple, List, Dict
+import os, io, math, asyncio, logging, sqlite3, traceback
+from typing import Optional, List, Dict
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -14,8 +14,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import ccxt
 
-# ─────────────── ENV CONFIG ───────────────
-BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
+# ───────────────────────── ENV ─────────────────────────
+BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 EXCHANGE    = os.getenv("EXCHANGE", "kucoin")
 EXCHANGES   = [e.strip() for e in os.getenv("EXCHANGES", EXCHANGE).split(",") if e.strip()]
 TIMEFRAME   = os.getenv("TIMEFRAME", "1m")
@@ -25,23 +25,21 @@ PUBLIC_URL  = os.getenv("PUBLIC_URL", "").strip()
 OWNER_ID    = int(os.getenv("OWNER_ID", "0"))
 MAX_SCOUT   = int(os.getenv("MAX_SCOUT", "25"))
 
-# ─────────────── DISCLAIMER ───────────────
+# ──────────────────────── LOGGING ─────────────────────
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("midnight-bot")
+
+# ───────────────────── DISCLAIMER ─────────────────────
 DISCLAIMER_TEXT = (
     "⚠️ *Disclaimer*\n\n"
     "This bot and all information provided are for *educational and entertainment purposes only*. "
     "Nothing here should be considered financial, investment, or trading advice.\n\n"
-    "Cryptocurrency trading is highly volatile and involves significant risk. "
-    "You could lose some or all of your capital. "
-    "Always do your own research and consult with a licensed financial advisor before making investment decisions.\n\n"
-    "By using this bot, you acknowledge that you are solely responsible for your trading decisions "
-    "and agree that the creators of this bot are not liable for any losses or damages."
+    "Crypto trading is highly volatile and risky. You could lose some or all capital. "
+    "Always do your own research and consult a licensed advisor.\n\n"
+    "By using this bot, you accept full responsibility for your decisions and agree the creators are not liable."
 )
 
-# ─────────────── LOGGING ───────────────
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
-
-# ─────────────── DB HELPERS ───────────────
+# ─────────────────────── DB HELPERS ───────────────────
 DB_FILE = "bot.db"
 
 def db_connect():
@@ -53,50 +51,43 @@ def get_param(strategy: str, key: str, default: str):
     conn = db_connect(); cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS params(strategy TEXT, key TEXT, val TEXT, PRIMARY KEY(strategy,key))")
     cur.execute("SELECT val FROM params WHERE strategy=? AND key=?", (strategy, key))
-    row = cur.fetchone()
-    conn.close()
+    row = cur.fetchone(); conn.close()
     return row["val"] if row else default
 
 def get_setting(key: str, default=None):
     conn = db_connect(); cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, val TEXT)")
     cur.execute("SELECT val FROM settings WHERE key=?", (key,))
-    row = cur.fetchone()
-    conn.close()
+    row = cur.fetchone(); conn.close()
     return row["val"] if row else default
 
-# ─────────────── STRATEGIES (external file) ───────────────
+# ─────────────────── STRATEGIES (external) ────────────
 import strategies
 from strategies import strategy_ma, strategy_rsi, strategy_scalp, strategy_event
 strategies.set_param_getter(get_param)  # inject DB getter
 
-# ─────────────── UTILS ───────────────
+# ──────────────────────── UTILS ───────────────────────
 def _normalize_tf(tf: Optional[str]) -> str:
-    if not tf:
-        return TIMEFRAME
+    if not tf: return TIMEFRAME
     t = tf.strip().lower()
     aliases = {
-        "d": "1d", "day": "1d", "daily": "1d",
-        "w": "1w", "wk": "1w", "weekly": "1w",
-        "mo": "1M", "month": "1M", "monthly": "1M",
-        "h": "1h", "hr": "1h", "hour": "1h",
-        "min": "1m", "minute": "1m",
+        "d":"1d","day":"1d","daily":"1d",
+        "w":"1w","wk":"1w","weekly":"1w",
+        "mo":"1M","month":"1M","monthly":"1M",
+        "h":"1h","hr":"1h","hour":"1h",
+        "min":"1m","minute":"1m",
     }
     return aliases.get(t, t)
 
 def _tf_seconds(tf: str) -> int:
     t = tf.lower()
-    if t.endswith("m") and t != "1m" and not t.endswith("M"):  # minutes (except '1M' monthly)
-        return int(t[:-1]) * 60
-    if t.endswith("h"):
-        return int(t[:-1]) * 3600
-    if t.endswith("d"):
-        return int(t[:-1]) * 86400
-    if t.endswith("w"):
-        return int(t[:-1]) * 604800
-    if t.endswith("m") or t.endswith("M"):  # monthly
-        return 30 * 86400
-    if t == "1m": return 60
+    if t.endswith("h"): return int(t[:-1]) * 3600
+    if t.endswith("d"): return int(t[:-1]) * 86400
+    if t.endswith("w"): return int(t[:-1]) * 604800
+    # monthly
+    if t.endswith("m") and t != "1m": return 30 * 86400
+    # minutes (e.g., 1m, 5m)
+    if t.endswith("m"): return int(t[:-1]) * 60
     return 60
 
 def _is_stale(last_dt: pd.Timestamp, tf: str):
@@ -130,16 +121,17 @@ def _choose_time_axis(ax, tf: str):
     ax.xaxis.set_major_formatter(formatter)
 
 def _atr_local(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    if df.empty: return pd.Series(dtype=float)
     h, l, c = df["high"], df["low"], df["close"]
     pc = c.shift(1)
     tr = pd.concat([(h - l), (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
 def _recommend_sl_tp(df: pd.DataFrame, entry: float, side: str = "long"):
-    atr = _atr_local(df, 14).iloc[-1]
+    atr = _atr_local(df, 14).iloc[-1] if len(df) else 0.0
     if not math.isfinite(atr) or atr <= 0:
-        atr = float(df["close"].rolling(14).std().iloc[-1] or 0.0)
-        if atr <= 0: atr = max(0.002 * entry, 1e-8)
+        atr = float(df["close"].rolling(14).std().iloc[-1] or 0.0) if len(df) else 0.0
+        if atr <= 0: atr = max(0.002 * (entry or 1.0), 1e-8)
     R = 1.5
     if side == "short":
         sl  = entry + 1.5 * atr
@@ -151,39 +143,35 @@ def _recommend_sl_tp(df: pd.DataFrame, entry: float, side: str = "long"):
         tp2 = entry + 2.0 * atr * R
     return float(sl), float(tp1), float(tp2), float(atr), R
 
-# ─────────────── PRICE AGGREGATOR (consensus) ───────────────
+# ─────────────── PRICE CONSENSUS (multi-exchange) ─────────
 class PriceAggregator:
     def __init__(self, exchange_names: List[str]):
         self.ex_objs: Dict[str, ccxt.Exchange] = {}
         for name in exchange_names:
-            if not hasattr(ccxt, name):
-                continue
-            try:
-                self.ex_objs[name] = getattr(ccxt, name)()
-            except Exception:
-                pass
+            if hasattr(ccxt, name):
+                try:
+                    self.ex_objs[name] = getattr(ccxt, name)()
+                except Exception:
+                    pass
 
     async def get_consensus(self, pair: str):
         prices = []
         used = 0
         for name, ex in self.ex_objs.items():
             try:
-                async def _run():
-                    return ex.fetch_ticker(pair)
-                t = await asyncio.to_thread(_run)
+                t = await asyncio.to_thread(ex.fetch_ticker, pair)
                 px = t.get("last") or t.get("close") or t.get("bid") or t.get("ask")
                 if px and math.isfinite(px):
                     prices.append(float(px)); used += 1
             except Exception:
                 continue
-        if not prices:
-            return None, 0, None, {}
+        if not prices: return None, 0, None, {}
         cons = float(np.mean(prices))
-        spread = float((max(prices) - min(prices))) if len(prices) > 1 else 0.0
+        spread = float(max(prices) - min(prices)) if len(prices) > 1 else 0.0
         return cons, used, spread, {}
 price_agg = PriceAggregator(EXCHANGES)
 
-# ─────────────── ENGINE ───────────────
+# ───────────────────── ENGINE ───────────────────────
 class Engine:
     def __init__(self, exchange="kucoin", tf="1m"):
         self.ex = getattr(ccxt, exchange)()
@@ -191,14 +179,12 @@ class Engine:
         self.valid_pairs: List[str] = []
 
     async def init_markets(self):
-        def _load():
-            self.ex.load_markets()
-            return list(self.ex.markets.keys())
         try:
-            pairs = await asyncio.to_thread(_load)
-            # keep popular quote markets
+            symbols = await asyncio.to_thread(self.ex.load_markets)
+            pairs = list(self.ex.markets.keys())
             self.valid_pairs = [p for p in pairs if any(p.endswith(q) for q in ("/USDT","/USD","/USDC"))]
             self.valid_pairs.sort()
+            log.info("Markets loaded: %d pairs", len(self.valid_pairs))
         except Exception as e:
             log.warning("init_markets failed: %s", e)
             self.valid_pairs = ["BTC/USDT","ETH/USDT","SOL/USDT"]
@@ -206,7 +192,6 @@ class Engine:
     def _resample(self, df: pd.DataFrame, tf: str) -> pd.DataFrame:
         if df.empty: return df
         d = df.copy().set_index("time")
-        rule = None
         if tf == "1d":
             rule = "1D"
         elif tf == "1w":
@@ -225,11 +210,9 @@ class Engine:
 
     async def fetch_df(self, pair: str, timeframe: Optional[str] = None, limit: int = 400) -> pd.DataFrame:
         tf = _normalize_tf(timeframe or self.tf)
-        # try native tf first
-        def _get(tf_in, lim):
-            return self.ex.fetch_ohlcv(pair, timeframe=tf_in, limit=lim)
+        # try native timeframe
         try:
-            ohlcv = await asyncio.to_thread(_get, tf, limit)
+            ohlcv = await asyncio.to_thread(self.ex.fetch_ohlcv, pair, tf, None, limit)
         except Exception as e:
             log.warning("fetch_ohlcv failed (%s %s): %s", pair, tf, e)
             ohlcv = []
@@ -252,7 +235,7 @@ class Engine:
             if need_resample:
                 base = "1h" if tf == "1d" else "1d"
                 try:
-                    raw = await asyncio.to_thread(_get, base, 1500 if base=="1h" else 400)
+                    raw = await asyncio.to_thread(self.ex.fetch_ohlcv, pair, base, None, 1500 if base=="1h" else 400)
                     bdf = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
                     bdf["time"] = pd.to_datetime(bdf["ts"], unit="ms", utc=True).dt.tz_convert(LOCAL_TZ)
                     bdf = bdf.drop_duplicates(subset=["time"], keep="last").sort_values("time").reset_index(drop=True)
@@ -266,12 +249,11 @@ class Engine:
         df = await self.fetch_df(pair, timeframe)
         if df.empty or len(df) < 60:
             return None, None, None, df
-        # very simple placeholder classifier based on short momentum
         look = min(10, max(5, len(df)//10))
-        prob = float(df["close"].iloc[-1] / df["close"].iloc[-look] - 1.0)
-        p_up = 1/(1+math.exp(-10*prob))
+        momentum = float(df["close"].iloc[-1] / df["close"].iloc[-look] - 1.0)
+        p_up = 1/(1+math.exp(-10*momentum))
         label = "BUY" if p_up >= 0.5 else "SELL"
-        explanation = f"mom({look})={(prob*100):.2f}%"
+        explanation = f"mom({look})={(momentum*100):.2f}%"
         return label, p_up, explanation, df
 
     async def analyze(self, pair: str):
@@ -279,7 +261,6 @@ class Engine:
         if df.empty or len(df) < 200:
             return None, df
         strat = (get_setting("strategy", "ma") or "ma").lower()
-        sig, reason = None, None
         if strat == "ma":
             sig, reason = strategy_ma(df)
         elif strat == "rsi":
@@ -297,13 +278,13 @@ class Engine:
         ts = row["time"].strftime("%Y-%m-%d %H:%M %Z")
         text = f"{sig} {pair} @ {price:.4g} [{self.tf}]  ({ts})\nStrategy: {strat.upper()} — {reason}"
         return (sig, text, price, ts), df
-        # ─────────────── FASTAPI + TELEGRAM ───────────────
+
+# ───────────────────── APP / BOT / SCHED ─────────────────────
 api = FastAPI()
 engine = Engine(exchange=EXCHANGE, tf=TIMEFRAME)
 application = Application.builder().token(BOT_TOKEN).build()
 scheduler = AsyncIOScheduler()
 
-# ─────────────── BASIC CHART HELPER ───────────────
 def _plot_basic_candle(df: pd.DataFrame, pair: str, tf: str, live_price: float | None = None) -> io.BytesIO:
     fig, ax = plt.subplots(figsize=(10,5), dpi=140)
     ax.plot(df["time"], df["close"], linewidth=1.2)
@@ -323,7 +304,7 @@ def _plot_basic_candle(df: pd.DataFrame, pair: str, tf: str, live_price: float |
     buf.seek(0)
     return buf
 
-# ─────────────── COMMANDS ───────────────
+# ───────────────────── COMMANDS ─────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(DISCLAIMER_TEXT, parse_mode="Markdown")
     await update.message.reply_text("👋 Welcome to Midnight Crypto Bot Trading!\nUse /help to see commands.")
@@ -335,10 +316,11 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/scout [TF] [HORIZON] [TOPN] — best longs\n"
         "/scout_short [TF] [HORIZON] [TOPN] — best shorts\n"
         "/scout_best [TF] [HORIZON] [TOPN] — best overall\n"
-        "/calc <entry> <exit> [size] — profit/SL/TP helper\n"
+        "/calc <entry> <exit> [size] — profit helper\n"
         "/dca_plan <budget> <n> — split buys\n"
         "/debug_tf <PAIR> [TF] — inspect candles\n"
-        "/foundation_check — data/time checks"
+        "/foundation_check — data/time checks\n"
+        "/runjob — manually run the scheduled scan"
     )
 
 async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -357,12 +339,10 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cons, used, spread, _ = await price_agg.get_consensus(pair)
     last_dt = df["time"].iloc[-1]
     img = _plot_basic_candle(df, pair, tf, live_price=cons)
-    cap = (f"{pair} — {tf}\n"
-           f"As of (last closed candle): {last_dt:%Y-%m-%d %H:%M %Z}")
+    cap = (f"{pair} — {tf}\nAs of (last closed candle): {last_dt:%Y-%m-%d %H:%M %Z}")
     if cons is not None:
         cap += f"\nConsensus: {cons:.6g} from {used} exchanges"
-        if spread and spread > 0:
-            cap += f" (spread {spread:.6g})"
+        if spread and spread > 0: cap += f" (spread {spread:.6g})"
         cap += "\nLive tick plotted on chart"
     await update.message.reply_photo(InputFile(img, filename="chart.png"), caption=cap)
 
@@ -373,8 +353,7 @@ async def cmd_debug_tf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     df = await engine.fetch_df(pair, tf)
     if df.empty:
         return await update.message.reply_text(f"No data for {pair} on {tf}.")
-    first = df["time"].iloc[0]; last = df["time"].iloc[-1]
-    now = pd.Timestamp.now(tz=LOCAL_TZ)
+    first = df["time"].iloc[0]; last = df["time"].iloc[-1]; now = pd.Timestamp.now(tz=LOCAL_TZ)
     await update.message.reply_text(
         f"{pair} ({tf}) candles: {len(df)}\n"
         f"First: {first:%Y-%m-%d %H:%M %Z}\n"
@@ -383,7 +362,7 @@ async def cmd_debug_tf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Stale? {'YES' if _is_stale(last, tf) else 'NO'}"
     )
 
-# ── SCOUT HELPERS ──
+# ─── SCOUT HELPERS ───
 def _eta_from_horizon(horizon_bars: int, tf: str) -> str:
     secs = _tf_seconds(tf) * max(1, int(horizon_bars))
     eta  = pd.Timestamp.now(tz=LOCAL_TZ) + pd.Timedelta(seconds=secs)
@@ -391,8 +370,7 @@ def _eta_from_horizon(horizon_bars: int, tf: str) -> str:
 
 async def _score_long(pair: str, tf: str, horizon: int):
     label, prob, expl, df = await engine.predict(pair, horizon=horizon, timeframe=tf)
-    if df is None or df.empty or len(df) < 120:
-        return None
+    if df is None or df.empty or len(df) < 120: return None
     try:
         d = df.copy()
         d["vol_ma"] = d["volume"].rolling(20).mean()
@@ -413,8 +391,7 @@ async def _score_long(pair: str, tf: str, horizon: int):
 
 async def _score_short(pair: str, tf: str, horizon: int):
     label, prob_up, expl, df = await engine.predict(pair, horizon=horizon, timeframe=tf)
-    if df is None or df.empty or len(df) < 120:
-        return None
+    if df is None or df.empty or len(df) < 120: return None
     try:
         d = df.copy()
         d["vol_ma"] = d["volume"].rolling(20).mean()
@@ -428,13 +405,13 @@ async def _score_short(pair: str, tf: str, horizon: int):
     px = float(cons) if (cons is not None and math.isfinite(cons)) else last_close
     sl, tp1, tp2, atr, R = _recommend_sl_tp(df, entry=px, side="short")
     p_down = 1.0 - float(prob_up or 0.0)
-    neg_m = max(-mom, 0.0)
+    neg_m  = max(-mom, 0.0)
     score = (0.75 * p_down) + (0.20 * neg_m) + (0.05 * min(volx/3.0, 1.0))
     return dict(pair=pair, prob=p_down, label=label, score=score, close=last_close,
                 cons=(float(cons) if cons is not None else None), used=used, spread=spread,
                 mom=mom, volx=volx, sl=sl, tp1=tp1, tp2=tp2, atr=atr, explanation=expl)
 
-# ── SCOUT COMMANDS ──
+# ─── SCOUT COMMANDS ───
 async def cmd_scout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = [a.strip().lower() for a in (ctx.args or [])]
     tf = TIMEFRAME; horizon = 5; topn = 5
@@ -445,8 +422,7 @@ async def cmd_scout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if a.isdigit():
             if horizon == 5: horizon = max(1, min(60, int(a))); args.remove(a)
             elif topn == 5: topn = max(1, min(25, int(a))); args.remove(a)
-    if not engine.valid_pairs:
-        await engine.init_markets()
+    if not engine.valid_pairs: await engine.init_markets()
     pool = engine.valid_pairs or ["BTC/USDT","ETH/USDT","SOL/USDT"]
     scan_list = pool[:MAX_SCOUT]
     status = await update.message.reply_text(f"🔎 Scouting up to {len(scan_list)} pairs on {tf} (h={horizon})…")
@@ -489,8 +465,7 @@ async def cmd_scout_short(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if a.isdigit():
             if horizon == 5: horizon = max(1, min(60, int(a))); args.remove(a)
             elif topn == 5: topn = max(1, min(25, int(a))); args.remove(a)
-    if not engine.valid_pairs:
-        await engine.init_markets()
+    if not engine.valid_pairs: await engine.init_markets()
     pool = engine.valid_pairs or ["BTC/USDT","ETH/USDT","SOL/USDT"]
     scan_list = pool[:MAX_SCOUT]
     status = await update.message.reply_text(f"🔎 Short scout: up to {len(scan_list)} pairs on {tf} (h={horizon})…")
@@ -520,7 +495,7 @@ async def cmd_scout_short(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     eta = _eta_from_horizon(horizon, tf)
     best = picks[0]
     foot = ["", f"Best short: {best['pair']} — P(down)={best['prob']*100:.1f}%", f"Est. review window around: {eta}",
-            "Notes: P(down)=1−P(up). MOM negative preferred. SL/TP via ATR(14)."]
+            "Notes: P(down)=1−P(up). Prefer negative MOM. SL/TP via ATR(14)."]
     await status.edit_text("\n".join(lines + foot))
 
 async def cmd_scout_best(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -533,8 +508,7 @@ async def cmd_scout_best(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if a.isdigit():
             if horizon == 5: horizon = max(1, min(60, int(a))); args.remove(a)
             elif topn == 5: topn = max(1, min(25, int(a))); args.remove(a)
-    if not engine.valid_pairs:
-        await engine.init_markets()
+    if not engine.valid_pairs: await engine.init_markets()
     pool = engine.valid_pairs or ["BTC/USDT","ETH/USDT","SOL/USDT"]
     scan_list = pool[:MAX_SCOUT]
     status = await update.message.reply_text(f"🔎 Best scout: up to {len(scan_list)} pairs on {tf} (h={horizon})…")
@@ -546,9 +520,7 @@ async def cmd_scout_best(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as e: log.warning("best long %s: %s", p, e); L=None
             try: S = await _score_short(p, tf, horizon)
             except Exception as e: log.warning("best short %s: %s", p, e); S=None
-            pick = None
-            if L and S: pick = (L if L["score"] >= S["score"] else S)
-            else: pick = L or S
+            pick = L if (L and (not S or L["score"] >= S["score"])) else S
             if pick:
                 pick = pick.copy()
                 pick["direction"] = ("LONG" if pick is L else "SHORT") if (L and S) else ("LONG" if L else "SHORT")
@@ -573,7 +545,7 @@ async def cmd_scout_best(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Notes: MOM short-term; VOLx vs 20-bar avg. SL/TP via ATR(14)."]
     await status.edit_text("\n".join(lines + foot))
 
-# ── CALC & DCA ──
+# ─── CALC & DCA ───
 async def cmd_calc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = [a for a in (ctx.args or [])]
     if len(args) < 2:
@@ -596,13 +568,13 @@ async def cmd_dca_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = [f"DCA plan: total ${budget:.2f} across {n} orders:", *[f"• Order {i+1}: ${per:.2f}" for i in range(n)]]
     await update.message.reply_text("\n".join(lines))
 
-# ── FOUNDATION CHECK ──
+# ─── FOUNDATION CHECK ───
 async def cmd_foundation_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pairs = ["BTC/USDT","ETH/USDT","SOL/USDT"]
     tfs   = ["1m","1h","1d","1w"]
     report = ["🔧 Foundation Check:"]
     for p in pairs:
-        line = [f"\n{p}:"]
+        row = [f"\n{p}:"]
         for tf in tfs:
             df = await engine.fetch_df(p, tf)
             ok = (not df.empty)
@@ -610,11 +582,35 @@ async def cmd_foundation_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             stale = _is_stale(last, tf) if ok else True
             tag = "PASS" if (ok and not stale) else "CHECK"
             when = (last.strftime("%Y-%m-%d %H:%M %Z") if last is not None else "—")
-            line.append(f"  {tf:<3} {tag:<5} last={when}")
-        report.append("\n".join(line))
+            row.append(f"  {tf:<3} {tag:<5} last={when}")
+        report.append("\n".join(row))
     await update.message.reply_text("\n".join(report))
 
-# ─────────────── REGISTER COMMANDS ───────────────
+# ─── SCHEDULER + MANUAL TRIGGER ───
+async def scheduled_job():
+    try:
+        if not engine.valid_pairs:
+            await engine.init_markets()
+        candidates = [p for p in engine.valid_pairs if p.endswith(("/USDT","/USD","/USDC"))][:5]
+        if not candidates: candidates = ["BTC/USDT","ETH/USDT","SOL/USDT"]
+        for pair in candidates:
+            try:
+                res, df = await engine.analyze(pair)
+                if res:
+                    log.info("Signal: %s", res[1])
+            except Exception as e:
+                log.error("analyze(%s) failed: %s\n%s", pair, e, traceback.format_exc())
+    except Exception as e:
+        log.error("scheduled_job top-level crash: %s\n%s", e, traceback.format_exc())
+
+async def cmd_runjob(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        await scheduled_job()
+        await update.message.reply_text("Runjob: ✅ completed (see logs for details).")
+    except Exception as e:
+        await update.message.reply_text(f"Runjob: ❌ {e}")
+
+# ─── REGISTER HANDLERS ───
 application.add_handler(CommandHandler("start", cmd_start))
 application.add_handler(CommandHandler("help", cmd_help))
 application.add_handler(CommandHandler("pairs", cmd_pairs))
@@ -626,53 +622,9 @@ application.add_handler(CommandHandler("scout_best", cmd_scout_best))
 application.add_handler(CommandHandler("calc", cmd_calc))
 application.add_handler(CommandHandler("dca_plan", cmd_dca_plan))
 application.add_handler(CommandHandler("foundation_check", cmd_foundation_check))
-# ── MANUAL TRIGGER FOR SCHEDULED JOB ──
-async def cmd_runjob(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        await scheduled_job()
-        await update.message.reply_text("Runjob: ✅ completed (check logs for details).")
-    except Exception as e:
-        await update.message.reply_text(f"Runjob: ❌ {e}")
-
 application.add_handler(CommandHandler("runjob", cmd_runjob))
-# ─────────────── SCHEDULER ───────────────
-import traceback
 
-async def scheduled_job():
-    try:
-        # Make sure markets are loaded (safe to call repeatedly)
-        if not engine.valid_pairs:
-            await engine.init_markets()
-
-        # Pick a small, safe subset to analyze
-        candidates = [p for p in engine.valid_pairs if p.endswith(("/USDT","/USD","/USDC"))][:5]
-        if not candidates:
-            candidates = ["BTC/USDT","ETH/USDT","SOL/USDT"]
-
-        for pair in candidates:
-            try:
-                res, df = await engine.analyze(pair)
-                if res:
-                    log.info("Signal: %s", res[1])
-            except Exception as e:
-                log.error("analyze(%s) failed: %s\n%s", pair, e, traceback.format_exc())
-
-    except Exception as e:
-        log.error("scheduled_job top-level crash: %s\n%s", e, traceback.format_exc())
-        # re-raise if you want APScheduler to record it as an error (optional)
-        # raise
-
-# Replace your add_job line with this (no lambda wrapper; let APScheduler await the coro)
-scheduler.add_job(
-    scheduled_job,
-    trigger="interval",
-    seconds=60,
-    coalesce=True,
-    max_instances=1,
-    misfire_grace_time=30,
-)
-
-# ─────────────── FASTAPI WEBHOOK ───────────────
+# ─── FASTAPI WEBHOOK + ROOT ───
 @api.post("/webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
@@ -684,7 +636,7 @@ async def telegram_webhook(request: Request):
 async def root():
     return {"ok": True, "bot": "Midnight Crypto Bot Trading"}
 
-# ─────────────── LIFECYCLE ───────────────
+# ─── LIFECYCLE ───
 @api.on_event("startup")
 async def on_startup():
     log.info("API startup")
@@ -697,10 +649,11 @@ async def on_startup():
         BotCommand("debug_tf","Debug candles"),
         BotCommand("scout","Scan longs"),
         BotCommand("scout_short","Scan shorts"),
-        BotCommand("scout_best","Scan best overall"),
-        BotCommand("calc","Profit calculator"),
+        BotCommand("scout_best","Best overall"),
+        BotCommand("calc","Profit calc"),
         BotCommand("dca_plan","DCA planner"),
         BotCommand("foundation_check","Data/time checks"),
+        BotCommand("runjob","Run scheduled job now"),
     ])
     await application.initialize()
     await application.start()
@@ -709,16 +662,21 @@ async def on_startup():
             await application.bot.set_webhook(url=f"{PUBLIC_URL}/webhook")
             log.info("Webhook set to %s/webhook", PUBLIC_URL)
         except TypeError:
-            # for older PTB versions missing 'timeout' kw
             await application.bot.set_webhook(f"{PUBLIC_URL}/webhook")
+    # start scheduler after bot is ready
     scheduler.start()
+    scheduler.add_job(scheduled_job, "interval", seconds=60, coalesce=True, max_instances=1, misfire_grace_time=30)
 
 @api.on_event("shutdown")
 async def on_shutdown():
     log.info("API shutdown")
-    scheduler.shutdown(wait=False)
+    try:
+        scheduler.shutdown(wait=False)
+    except Exception:
+        pass
     await application.stop()
 
+# ─── ENTRYPOINT (binds to $PORT on Render if you run python app.py) ───
 if __name__ == "__main__":
-    import uvicorn, os
-    uvicorn.run("app:api", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), workers=1)
+    import uvicorn
+    uvicorn.run("app:api", host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
