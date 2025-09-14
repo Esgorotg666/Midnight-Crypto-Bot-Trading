@@ -628,15 +628,41 @@ application.add_handler(CommandHandler("dca_plan", cmd_dca_plan))
 application.add_handler(CommandHandler("foundation_check", cmd_foundation_check))
 
 # ─────────────── SCHEDULER ───────────────
+import traceback
+
 async def scheduled_job():
-    for pair in ["BTC/USDT","ETH/USDT","SOL/USDT"]:
-        try:
-            res, df = await engine.analyze(pair)
-            if res:
-                log.info("Signal: %s", res[1])
-        except Exception as e:
-            log.error("scheduled_job crashed: %s", e)
-scheduler.add_job(lambda: asyncio.create_task(scheduled_job()), "interval", minutes=1)
+    try:
+        # Make sure markets are loaded (safe to call repeatedly)
+        if not engine.valid_pairs:
+            await engine.init_markets()
+
+        # Pick a small, safe subset to analyze
+        candidates = [p for p in engine.valid_pairs if p.endswith(("/USDT","/USD","/USDC"))][:5]
+        if not candidates:
+            candidates = ["BTC/USDT","ETH/USDT","SOL/USDT"]
+
+        for pair in candidates:
+            try:
+                res, df = await engine.analyze(pair)
+                if res:
+                    log.info("Signal: %s", res[1])
+            except Exception as e:
+                log.error("analyze(%s) failed: %s\n%s", pair, e, traceback.format_exc())
+
+    except Exception as e:
+        log.error("scheduled_job top-level crash: %s\n%s", e, traceback.format_exc())
+        # re-raise if you want APScheduler to record it as an error (optional)
+        # raise
+
+# Replace your add_job line with this (no lambda wrapper; let APScheduler await the coro)
+scheduler.add_job(
+    scheduled_job,
+    trigger="interval",
+    seconds=60,
+    coalesce=True,
+    max_instances=1,
+    misfire_grace_time=30,
+)
 
 # ─────────────── FASTAPI WEBHOOK ───────────────
 @api.post("/webhook")
