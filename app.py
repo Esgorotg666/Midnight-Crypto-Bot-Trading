@@ -626,7 +626,15 @@ application.add_handler(CommandHandler("scout_best", cmd_scout_best))
 application.add_handler(CommandHandler("calc", cmd_calc))
 application.add_handler(CommandHandler("dca_plan", cmd_dca_plan))
 application.add_handler(CommandHandler("foundation_check", cmd_foundation_check))
+# ── MANUAL TRIGGER FOR SCHEDULED JOB ──
+async def cmd_runjob(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        await scheduled_job()
+        await update.message.reply_text("Runjob: ✅ completed (check logs for details).")
+    except Exception as e:
+        await update.message.reply_text(f"Runjob: ❌ {e}")
 
+application.add_handler(CommandHandler("runjob", cmd_runjob))
 # ─────────────── SCHEDULER ───────────────
 import traceback
 
