@@ -684,3 +684,7 @@ async def on_shutdown():
     log.info("API shutdown")
     scheduler.shutdown(wait=False)
     await application.stop()
+
+if __name__ == "__main__":
+    import uvicorn, os
+    uvicorn.run("app:api", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), workers=1)
