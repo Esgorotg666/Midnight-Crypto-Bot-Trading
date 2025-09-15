@@ -119,6 +119,14 @@ def _choose_time_axis(ax, tf: str):
             formatter = mdates.DateFormatter("%b %d\n%Y", tz=LOCAL_TZ)
     ax.xaxis.set_major_locator(locator)
     ax.xaxis.set_major_formatter(formatter)
+    # NEW: force x-limits to the data (prevents matplotlib from repeating labels)
+    try:
+        line = ax.get_lines()[0]
+        xs = line.get_xdata()
+        if len(xs):
+            ax.set_xlim(xs[0], xs[-1])
+    except Exception:
+        pass
 
 def _atr_local(df: pd.DataFrame, period: int = 14) -> pd.Series:
     if df.empty: return pd.Series(dtype=float)
@@ -188,40 +196,79 @@ class Engine:
         except Exception as e:
             log.warning("init_markets failed: %s", e)
             self.valid_pairs = ["BTC/USDT","ETH/USDT","SOL/USDT"]
-
+    
     def _resample(self, df: pd.DataFrame, tf: str) -> pd.DataFrame:
         if df.empty: return df
         d = df.copy().set_index("time")
+
+        # right-closed bins with right labels = "end of period"
         if tf == "1d":
             rule = "1D"
+            closed = label = "right"
         elif tf == "1w":
             rule = "1W-MON"
+            closed = label = "right"
         elif tf in ("1m","1M"):
-            rule = "1MS"
+            rule = "1MS"  # month start; 'right' labels show month end timestamps
+            closed = label = "right"
         else:
             return d.reset_index()
-        o = d["open"].resample(rule).first()
-        h = d["high"].resample(rule).max()
-        l = d["low"].resample(rule).min()
-        c = d["close"].resample(rule).last()
-        v = d["volume"].resample(rule).sum()
-        out = pd.DataFrame({"open":o,"high":h,"low":l,"close":c,"volume":v}).dropna().reset_index()
-        return out
 
+        out = d.resample(rule, closed=closed, label=label).agg({
+            "open":"first","high":"max","low":"min","close":"last","volume":"sum"
+        }).dropna().reset_index()
+
+        # drop any partial last bin that hasn't closed yet
+        # (compare last timestamp to now floored to the same rule)
+        now_loc = pd.Timestamp.now(tz=LOCAL_TZ)
+        if tf == "1d":
+            cutoff = (now_loc.floor("D"))
+        elif tf == "1w":
+            cutoff = (now_loc - pd.Timedelta(days=now_loc.weekday())).floor("D")  # Monday floor
+        else:  # 1M
+            cutoff = now_loc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        if len(out) and out["time"].iloc[-1] >= cutoff and _is_stale(out["time"].iloc[-1], tf):
+            out = out.iloc[:-1].reset_index(drop=True)
+
+        return out
+   
     async def fetch_df(self, pair: str, timeframe: Optional[str] = None, limit: int = 400) -> pd.DataFrame:
         tf = _normalize_tf(timeframe or self.tf)
-        # try native timeframe
+
+        # map timeframe -> milliseconds
+        def tf_ms(s: str) -> int:
+            s = s.lower()
+            if s.endswith("ms"): return int(s[:-2])
+            if s.endswith("s"):  return int(s[:-1]) * 1000
+            if s.endswith("m") and s != "1m": return int(s[:-1]) * 60_000     # 'm' monthly handled below
+            if s.endswith("h"):  return int(s[:-1]) * 3_600_000
+            if s.endswith("d"):  return int(s[:-1]) * 86_400_000
+            if s.endswith("w"):  return int(s[:-1]) * 604_800_000
+            if s in ("1m",):     return 60_000
+            if s in ("1m","1M"): return 2_592_000_000  # monthly fallback (~30d)
+            return 60_000
+
+        # ask for a wide enough window ending *now* (in UTC)
+        now_ms   = int(pd.Timestamp.utcnow().timestamp() * 1000)
+        span_ms  = tf_ms(tf) * (limit + 5) * 2
+        since_ms = max(0, now_ms - span_ms)
+
+        # try native TF first with explicit 'since'
         try:
-            ohlcv = await asyncio.to_thread(self.ex.fetch_ohlcv, pair, tf, None, limit)
+            raw = await asyncio.to_thread(self.ex.fetch_ohlcv, pair, tf, since_ms, limit)
         except Exception as e:
             log.warning("fetch_ohlcv failed (%s %s): %s", pair, tf, e)
-            ohlcv = []
-        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"]) if ohlcv else pd.DataFrame()
+            raw = []
+
+        df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"]) if raw else pd.DataFrame()
         if not df.empty:
+            # convert to your display tz
             df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert(LOCAL_TZ)
+            # de-dupe + sort
             df = df.drop_duplicates(subset=["time"], keep="last").sort_values("time").reset_index(drop=True)
 
-        # fallback/resample for higher TFs if stale or empty
+        # resample (daily/weekly/monthly) from lower TF if empty or stale
         if tf in ("1d","1w","1M"):
             need_resample = True
             if not df.empty:
@@ -230,21 +277,26 @@ class Engine:
                 if tf == "1d":
                     need_resample |= (last_dt.date() != pd.Timestamp.now(tz=LOCAL_TZ).date())
                 elif tf == "1w":
-                    now = pd.Timestamp.now(tz=LOCAL_TZ)
-                    need_resample |= (last_dt.isocalendar()[:2] != now.isocalendar()[:2])
+                    now_loc = pd.Timestamp.now(tz=LOCAL_TZ)
+                    need_resample |= (last_dt.isocalendar()[:2] != now_loc.isocalendar()[:2])
+
             if need_resample:
                 base = "1h" if tf == "1d" else "1d"
+                base_limit = 1500 if base == "1h" else 500
+                base_span  = tf_ms(base) * (base_limit + 5) * 2
+                base_since = max(0, now_ms - base_span)
                 try:
-                    raw = await asyncio.to_thread(self.ex.fetch_ohlcv, pair, base, None, 1500 if base=="1h" else 400)
-                    bdf = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
+                    bro = await asyncio.to_thread(self.ex.fetch_ohlcv, pair, base, base_since, base_limit)
+                    bdf = pd.DataFrame(bro, columns=["ts","open","high","low","close","volume"])
                     bdf["time"] = pd.to_datetime(bdf["ts"], unit="ms", utc=True).dt.tz_convert(LOCAL_TZ)
                     bdf = bdf.drop_duplicates(subset=["time"], keep="last").sort_values("time").reset_index(drop=True)
                     df = self._resample(bdf, tf)
                 except Exception as e:
                     log.warning("resample fallback failed (%s %s): %s", pair, tf, e)
 
-        return df if not df.empty else pd.DataFrame(columns=["time","open","high","low","close","volume"])
-
+        # final guard: consistent columns even if empty
+        return df if not df.empty else pd.DataFrame(columns=["time","open","high","low","close","volume"])c
+    
     async def predict(self, pair: str, horizon: int = 5, timeframe: Optional[str] = None):
         df = await self.fetch_df(pair, timeframe)
         if df.empty or len(df) < 60:
