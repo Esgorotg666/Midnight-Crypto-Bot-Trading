@@ -733,6 +733,8 @@ async def root():
 async def on_startup():
     log.info("API startup")
     await engine.init_markets()
+
+    # Set bot commands
     await application.bot.set_my_commands([
         BotCommand("start","Start"),
         BotCommand("help","Help"),
@@ -747,15 +749,28 @@ async def on_startup():
         BotCommand("foundation_check","Data/time checks"),
         BotCommand("runjob","Run scheduled job now"),
     ])
+
     await application.initialize()
     await application.start()
+
+    # Bot identity for logs
+    try:
+        me = await application.bot.get_me()
+        log.info("Bot connected as @%s (id=%s)", me.username, me.id)
+    except Exception as e:
+        log.error("get_me failed: %s", e)
+
+    # Robust webhook setup
     if PUBLIC_URL:
-        try:
-            await application.bot.set_webhook(url=f"{PUBLIC_URL}/webhook")
-            log.info("Webhook set to %s/webhook", PUBLIC_URL)
-        except TypeError:
-            await application.bot.set_webhook(f"{PUBLIC_URL}/webhook")
-   
+        ok = await ensure_webhook(application.bot, PUBLIC_URL)
+        if not ok:
+            log.error("Webhook could not be set — bot will not receive updates until fixed.")
+    else:
+        log.warning("PUBLIC_URL is empty; cannot set webhook.")
+
+    # Start scheduler
+    scheduler.start()
+    scheduler.add_job(scheduled_job, "interval", seconds=60, coalesce=True, max_instances=1, misfire_grace_time=30)
     # Diagnostics
     try:
         me = await application.bot.get_me()
