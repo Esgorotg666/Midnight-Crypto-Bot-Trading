@@ -268,6 +268,46 @@ class Engine:
             # de-dupe + sort
             df = df.drop_duplicates(subset=["time"], keep="last").sort_values("time").reset_index(drop=True)
 
+import asyncio
+from telegram.error import RetryAfter, TimedOut, NetworkError
+
+async def ensure_webhook(bot, url: str, max_attempts: int = 8):
+    """
+    Set Telegram webhook with exponential backoff.
+    Handles flood control (429), timeouts, and transient network errors.
+    """
+    if not url:
+        return False
+
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
+    delay = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await bot.set_webhook(f"{url}/webhook")
+            info = await bot.get_webhook_info()
+            if info and info.url:
+                logging.info("Webhook set to %s (attempt %d)", info.url, attempt)
+                return True
+        except RetryAfter as e:
+            wait = getattr(e, "retry_after", int(delay))
+            logging.warning("Webhook RetryAfter: waiting %ss (attempt %d)", wait, attempt)
+            await asyncio.sleep(wait)
+        except (TimedOut, NetworkError) as e:
+            logging.warning("Webhook transient error: %s (attempt %d). Retrying in %.1fs", e, attempt, delay)
+            await asyncio.sleep(delay)
+        except Exception as e:
+            logging.error("Webhook set failed: %s (attempt %d). Retrying in %.1fs", e, attempt, delay)
+            await asyncio.sleep(delay)
+
+        delay = min(delay * 2, 60.0)
+
+    logging.error("Failed to set webhook after %d attempts.", max_attempts)
+    return False
+        
         # resample (daily/weekly/monthly) from lower TF if empty or stale
         if tf in ("1d","1w","1M"):
             need_resample = True
