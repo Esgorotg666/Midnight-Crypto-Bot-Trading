@@ -715,6 +715,41 @@ async def on_startup():
             log.info("Webhook set to %s/webhook", PUBLIC_URL)
         except TypeError:
             await application.bot.set_webhook(f"{PUBLIC_URL}/webhook")
+   
+    # Diagnostics
+    try:
+        me = await application.bot.get_me()
+        log.info("Bot connected as @%s (id=%s)", me.username, me.id)
+    except Exception as e:
+        log.error("get_me failed: %s", e)
+
+    # Force-reset webhook, then set it explicitly
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Deleted old webhook")
+    except Exception as e:
+        log.warning("delete_webhook warning: %s", e)
+
+    if PUBLIC_URL:
+        try:
+            # Some PTB versions accept only positional arg
+            await application.bot.set_webhook(f"{PUBLIC_URL}/webhook")
+            log.info("Webhook set to %s/webhook", PUBLIC_URL)
+        except TypeError:
+            await application.bot.set_webhook(url=f"{PUBLIC_URL}/webhook")
+            log.info("Webhook set (kwarg) to %s/webhook", PUBLIC_URL)
+        except Exception as e:
+            log.error("set_webhook failed: %s", e)
+
+    # Log Telegram's view of the webhook
+    try:
+        info = await application.bot.get_webhook_info()
+        log.info("Webhook info: url=%s, pending=%s, last_error_date=%s, last_error_message=%s",
+                 info.url, info.pending_update_count, getattr(info, "last_error_date", None),
+                 getattr(info, "last_error_message", None))
+    except Exception as e:
+        log.warning("get_webhook_info failed: %s", e)
+    
     # start scheduler after bot is ready
     scheduler.start()
     scheduler.add_job(scheduled_job, "interval", seconds=60, coalesce=True, max_instances=1, misfire_grace_time=30)
