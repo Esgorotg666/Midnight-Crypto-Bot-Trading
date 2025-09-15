@@ -295,7 +295,7 @@ class Engine:
                     log.warning("resample fallback failed (%s %s): %s", pair, tf, e)
 
         # final guard: consistent columns even if empty
-        return df if not df.empty else pd.DataFrame(columns=["time","open","high","low","close","volume"])c
+        return df if not df.empty else pd.DataFrame(columns=["time","open","high","low","close","volume"])
     
     async def predict(self, pair: str, horizon: int = 5, timeframe: Optional[str] = None):
         df = await self.fetch_df(pair, timeframe)
