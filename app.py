@@ -1,5 +1,7 @@
+# app.py
 import os, io, math, asyncio, logging, sqlite3, traceback
 from typing import Optional, List, Dict
+
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -11,6 +13,7 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request
 from telegram import Update, BotCommand, InputFile
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import RetryAfter, TimedOut, NetworkError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import ccxt
 
@@ -25,8 +28,13 @@ PUBLIC_URL  = os.getenv("PUBLIC_URL", "").strip()
 OWNER_ID    = int(os.getenv("OWNER_ID", "0"))
 MAX_SCOUT   = int(os.getenv("MAX_SCOUT", "25"))
 
+if not BOT_TOKEN:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+if not PUBLIC_URL:
+    raise RuntimeError("Missing PUBLIC_URL")
+
 # ──────────────────────── LOGGING ─────────────────────
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("midnight-bot")
 
 # ───────────────────── DISCLAIMER ─────────────────────
@@ -84,9 +92,7 @@ def _tf_seconds(tf: str) -> int:
     if t.endswith("h"): return int(t[:-1]) * 3600
     if t.endswith("d"): return int(t[:-1]) * 86400
     if t.endswith("w"): return int(t[:-1]) * 604800
-    # monthly
-    if t.endswith("m") and t != "1m": return 30 * 86400
-    # minutes (e.g., 1m, 5m)
+    if t.endswith("m") and t != "1m": return 30 * 86400  # month approx
     if t.endswith("m"): return int(t[:-1]) * 60
     return 60
 
@@ -119,7 +125,6 @@ def _choose_time_axis(ax, tf: str):
             formatter = mdates.DateFormatter("%b %d\n%Y", tz=LOCAL_TZ)
     ax.xaxis.set_major_locator(locator)
     ax.xaxis.set_major_formatter(formatter)
-    # NEW: force x-limits to the data (prevents matplotlib from repeating labels)
     try:
         line = ax.get_lines()[0]
         xs = line.get_xdata()
@@ -158,7 +163,7 @@ class PriceAggregator:
         for name in exchange_names:
             if hasattr(ccxt, name):
                 try:
-                    self.ex_objs[name] = getattr(ccxt, name)()
+                    self.ex_objs[name] = getattr(ccxt, name)({"enableRateLimit": True})
                 except Exception:
                     pass
 
@@ -173,22 +178,24 @@ class PriceAggregator:
                     prices.append(float(px)); used += 1
             except Exception:
                 continue
-        if not prices: return None, 0, None, {}
+        if not prices:
+            return None, 0, None, {}
         cons = float(np.mean(prices))
         spread = float(max(prices) - min(prices)) if len(prices) > 1 else 0.0
         return cons, used, spread, {}
+
 price_agg = PriceAggregator(EXCHANGES)
 
 # ───────────────────── ENGINE ───────────────────────
 class Engine:
     def __init__(self, exchange="kucoin", tf="1m"):
-        self.ex = getattr(ccxt, exchange)()
+        self.ex = getattr(ccxt, exchange)({"enableRateLimit": True})
         self.tf = tf
         self.valid_pairs: List[str] = []
 
     async def init_markets(self):
         try:
-            symbols = await asyncio.to_thread(self.ex.load_markets)
+            await asyncio.to_thread(self.ex.load_markets)
             pairs = list(self.ex.markets.keys())
             self.valid_pairs = [p for p in pairs if any(p.endswith(q) for q in ("/USDT","/USD","/USDC"))]
             self.valid_pairs.sort()
@@ -196,21 +203,18 @@ class Engine:
         except Exception as e:
             log.warning("init_markets failed: %s", e)
             self.valid_pairs = ["BTC/USDT","ETH/USDT","SOL/USDT"]
-    
+
     def _resample(self, df: pd.DataFrame, tf: str) -> pd.DataFrame:
         if df.empty: return df
         d = df.copy().set_index("time")
 
         # right-closed bins with right labels = "end of period"
         if tf == "1d":
-            rule = "1D"
-            closed = label = "right"
+            rule = "1D"; closed = label = "right"
         elif tf == "1w":
-            rule = "1W-MON"
-            closed = label = "right"
+            rule = "1W-MON"; closed = label = "right"
         elif tf in ("1m","1M"):
-            rule = "1MS"  # month start; 'right' labels show month end timestamps
-            closed = label = "right"
+            rule = "1MS"; closed = label = "right"
         else:
             return d.reset_index()
 
@@ -218,21 +222,20 @@ class Engine:
             "open":"first","high":"max","low":"min","close":"last","volume":"sum"
         }).dropna().reset_index()
 
-        # drop any partial last bin that hasn't closed yet
-        # (compare last timestamp to now floored to the same rule)
+        # drop partial last bin
         now_loc = pd.Timestamp.now(tz=LOCAL_TZ)
         if tf == "1d":
-            cutoff = (now_loc.floor("D"))
+            cutoff = now_loc.floor("D")
         elif tf == "1w":
             cutoff = (now_loc - pd.Timedelta(days=now_loc.weekday())).floor("D")  # Monday floor
-        else:  # 1M
+        else:
             cutoff = now_loc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
         if len(out) and out["time"].iloc[-1] >= cutoff and _is_stale(out["time"].iloc[-1], tf):
             out = out.iloc[:-1].reset_index(drop=True)
 
         return out
-   
+
     async def fetch_df(self, pair: str, timeframe: Optional[str] = None, limit: int = 400) -> pd.DataFrame:
         tf = _normalize_tf(timeframe or self.tf)
 
@@ -241,20 +244,20 @@ class Engine:
             s = s.lower()
             if s.endswith("ms"): return int(s[:-2])
             if s.endswith("s"):  return int(s[:-1]) * 1000
-            if s.endswith("m") and s != "1m": return int(s[:-1]) * 60_000     # 'm' monthly handled below
+            if s.endswith("m") and s != "1m": return int(s[:-1]) * 60_000
             if s.endswith("h"):  return int(s[:-1]) * 3_600_000
             if s.endswith("d"):  return int(s[:-1]) * 86_400_000
             if s.endswith("w"):  return int(s[:-1]) * 604_800_000
             if s in ("1m",):     return 60_000
-            if s in ("1m","1M"): return 2_592_000_000  # monthly fallback (~30d)
+            if s in ("1m","1M"): return 2_592_000_000  # ~30d
             return 60_000
 
-        # ask for a wide enough window ending *now* (in UTC)
+        # window ending now (UTC)
         now_ms   = int(pd.Timestamp.utcnow().timestamp() * 1000)
         span_ms  = tf_ms(tf) * (limit + 5) * 2
         since_ms = max(0, now_ms - span_ms)
 
-        # try native TF first with explicit 'since'
+        # try native TF first
         try:
             raw = await asyncio.to_thread(self.ex.fetch_ohlcv, pair, tf, since_ms, limit)
         except Exception as e:
@@ -263,51 +266,9 @@ class Engine:
 
         df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"]) if raw else pd.DataFrame()
         if not df.empty:
-            # convert to your display tz
             df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert(LOCAL_TZ)
-            # de-dupe + sort
             df = df.drop_duplicates(subset=["time"], keep="last").sort_values("time").reset_index(drop=True)
 
-import asyncio
-from telegram.error import RetryAfter, TimedOut, NetworkError
-
-async def ensure_webhook(bot, url: str, max_attempts: int = 8):
-    """
-    Set Telegram webhook with exponential backoff.
-    Handles flood control (429), timeouts, and transient network errors.
-    """
-    if not url:
-        return False
-
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-
-    delay = 1.0
-    for attempt in range(1, max_attempts + 1):
-        try:
-            await bot.set_webhook(f"{url}/webhook")
-            info = await bot.get_webhook_info()
-            if info and info.url:
-                logging.info("Webhook set to %s (attempt %d)", info.url, attempt)
-                return True
-        except RetryAfter as e:
-            wait = getattr(e, "retry_after", int(delay))
-            logging.warning("Webhook RetryAfter: waiting %ss (attempt %d)", wait, attempt)
-            await asyncio.sleep(wait)
-        except (TimedOut, NetworkError) as e:
-            logging.warning("Webhook transient error: %s (attempt %d). Retrying in %.1fs", e, attempt, delay)
-            await asyncio.sleep(delay)
-        except Exception as e:
-            logging.error("Webhook set failed: %s (attempt %d). Retrying in %.1fs", e, attempt, delay)
-            await asyncio.sleep(delay)
-
-        delay = min(delay * 2, 60.0)
-
-    logging.error("Failed to set webhook after %d attempts.", max_attempts)
-    return False
-        
         # resample (daily/weekly/monthly) from lower TF if empty or stale
         if tf in ("1d","1w","1M"):
             need_resample = True
@@ -334,9 +295,9 @@ async def ensure_webhook(bot, url: str, max_attempts: int = 8):
                 except Exception as e:
                     log.warning("resample fallback failed (%s %s): %s", pair, tf, e)
 
-        # final guard: consistent columns even if empty
+        # final guard
         return df if not df.empty else pd.DataFrame(columns=["time","open","high","low","close","volume"])
-    
+
     async def predict(self, pair: str, horizon: int = 5, timeframe: Optional[str] = None):
         df = await self.fetch_df(pair, timeframe)
         if df.empty or len(df) < 60:
@@ -370,6 +331,45 @@ async def ensure_webhook(bot, url: str, max_attempts: int = 8):
         ts = row["time"].strftime("%Y-%m-%d %H:%M %Z")
         text = f"{sig} {pair} @ {price:.4g} [{self.tf}]  ({ts})\nStrategy: {strat.upper()} — {reason}"
         return (sig, text, price, ts), df
+
+# ───────────────────── WEBHOOK SETUP ─────────────────────
+async def ensure_webhook(bot, url: str, max_attempts: int = 8):
+    """
+    Set Telegram webhook with exponential backoff.
+    Handles flood control (429), timeouts, and transient network errors.
+    """
+    if not url:
+        return False
+
+    # Clean old webhook once
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
+    delay = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await bot.set_webhook(f"{url}/webhook")
+            info = await bot.get_webhook_info()
+            if info and info.url:
+                logging.info("Webhook set to %s (attempt %d)", info.url, attempt)
+                return True
+        except RetryAfter as e:
+            wait = getattr(e, "retry_after", int(delay))
+            logging.warning("Webhook RetryAfter: waiting %ss (attempt %d)", wait, attempt)
+            await asyncio.sleep(wait)
+        except (TimedOut, NetworkError) as e:
+            logging.warning("Webhook transient error: %s (attempt %d). Retrying in %.1fs", e, attempt, delay)
+            await asyncio.sleep(delay)
+        except Exception as e:
+            logging.error("Webhook set failed: %s (attempt %d). Retrying in %.1fs", e, attempt, delay)
+            await asyncio.sleep(delay)
+
+        delay = min(delay * 2, 60.0)
+
+    logging.error("Failed to set webhook after %d attempts.", max_attempts)
+    return False
 
 # ───────────────────── APP / BOT / SCHED ─────────────────────
 api = FastAPI()
@@ -657,7 +657,7 @@ async def cmd_dca_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Usage: /dca_plan <budget> <n_orders>\nExample: /dca_plan 1000 5")
     budget = float(args[0]); n = max(1, int(args[1]))
     per = budget / n
-    lines = [f"DCA plan: total ${budget:.2f} across {n} orders:", *[f"• Order {i+1}: ${per:.2f}" for i in range(n)]]
+    lines = [f"DCA plan: total ${budget:.2f} across {n} orders:"] + [f"• Order {i+1}: ${per:.2f}" for i in range(n)]
     await update.message.reply_text("\n".join(lines))
 
 # ─── FOUNDATION CHECK ───
@@ -732,9 +732,7 @@ async def root():
 @api.on_event("startup")
 async def on_startup():
     log.info("API startup")
-    await engine.init_markets()
-
-    # Set bot commands
+    # bot commands (safe pre-initialize)
     await application.bot.set_my_commands([
         BotCommand("start","Start"),
         BotCommand("help","Help"),
@@ -753,14 +751,13 @@ async def on_startup():
     await application.initialize()
     await application.start()
 
-    # Bot identity for logs
     try:
         me = await application.bot.get_me()
         log.info("Bot connected as @%s (id=%s)", me.username, me.id)
     except Exception as e:
         log.error("get_me failed: %s", e)
 
-    # Robust webhook setup
+    # Robust webhook (single path)
     if PUBLIC_URL:
         ok = await ensure_webhook(application.bot, PUBLIC_URL)
         if not ok:
@@ -768,44 +765,7 @@ async def on_startup():
     else:
         log.warning("PUBLIC_URL is empty; cannot set webhook.")
 
-    # Start scheduler
-    scheduler.start()
-    scheduler.add_job(scheduled_job, "interval", seconds=60, coalesce=True, max_instances=1, misfire_grace_time=30)
-    # Diagnostics
-    try:
-        me = await application.bot.get_me()
-        log.info("Bot connected as @%s (id=%s)", me.username, me.id)
-    except Exception as e:
-        log.error("get_me failed: %s", e)
-
-    # Force-reset webhook, then set it explicitly
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Deleted old webhook")
-    except Exception as e:
-        log.warning("delete_webhook warning: %s", e)
-
-    if PUBLIC_URL:
-        try:
-            # Some PTB versions accept only positional arg
-            await application.bot.set_webhook(f"{PUBLIC_URL}/webhook")
-            log.info("Webhook set to %s/webhook", PUBLIC_URL)
-        except TypeError:
-            await application.bot.set_webhook(url=f"{PUBLIC_URL}/webhook")
-            log.info("Webhook set (kwarg) to %s/webhook", PUBLIC_URL)
-        except Exception as e:
-            log.error("set_webhook failed: %s", e)
-
-    # Log Telegram's view of the webhook
-    try:
-        info = await application.bot.get_webhook_info()
-        log.info("Webhook info: url=%s, pending=%s, last_error_date=%s, last_error_message=%s",
-                 info.url, info.pending_update_count, getattr(info, "last_error_date", None),
-                 getattr(info, "last_error_message", None))
-    except Exception as e:
-        log.warning("get_webhook_info failed: %s", e)
-    
-    # start scheduler after bot is ready
+    # Start scheduler (once)
     scheduler.start()
     scheduler.add_job(scheduled_job, "interval", seconds=60, coalesce=True, max_instances=1, misfire_grace_time=30)
 
